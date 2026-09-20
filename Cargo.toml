@@ -1,0 +1,23 @@
+[package]
+name = "kast"
+version = "0.1.0"
+edition = "2024"
+description = "GPU photorealistic renderer built on wgpu: deferred PBR, IBL, cascaded shadows, SSAO, SSR, bloom and ACES tonemapping"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+env_logger = "0.11.11"
+glam = "0.33.7"
+gltf = { version = "1.4.1", features = ["KHR_lights_punctual", "KHR_materials_emissive_strength", "KHR_texture_transform", "KHR_materials_unlit"] }
+image = "0.25.10"
+log = "0.4.34"
+pollster = "1.0.1"
+wgpu = "22.1.0"
+winit = "0.30.13"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
