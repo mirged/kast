@@ -29,7 +29,7 @@ fn sample_kernel(i: u32, n: u32) -> vec3<f32> {
 @fragment
 fn fs_ssao(in: FullscreenOut) -> @location(0) vec4<f32> {
     let depth = textureSampleLevel(depth_tex, tex_sampler, in.uv, 0.0);
-    if depth >= 1.0 {
+    if depth <= 0.0 {
         return vec4<f32>(1.0, 0.0, 0.0, 0.0);
     }
 

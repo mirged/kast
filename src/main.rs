@@ -1,22 +1,14 @@
 mod app;
-mod camera;
-mod context;
-mod geometry;
-mod gpu;
-mod material;
-mod mesh;
-mod renderer;
-mod scene;
-mod types;
+use kast::{gpu, scene};
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use winit::event_loop::{ControlFlow, EventLoop};
 
-use crate::camera::Camera;
-use crate::context::GpuContext;
-use crate::renderer::Renderer;
-use crate::scene::loader;
+use kast::camera::Camera;
+use kast::context::GpuContext;
+use kast::renderer::Renderer;
+use kast::scene::loader;
 
 struct Args {
     model: Option<PathBuf>,
@@ -215,7 +207,7 @@ fn readback(
     height: u32,
 ) -> Vec<u8> {
     let unpadded = width * 4;
-    let padded = crate::gpu::align_to(unpadded, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let padded = gpu::align_to(unpadded, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
         size: (padded * height) as u64,

@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use std::collections::HashSet;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -22,6 +22,9 @@ pub struct Camera {
     pub speed: f32,
     pub sensitivity: f32,
     pub exposure_ev: f32,
+    /// Full 3-axis orientation (camera looks down local -Z, local +Y is up).
+    /// When set it overrides yaw/pitch, allowing roll (cockpit / chase cameras).
+    pub orientation: Option<Quat>,
     keys: HashSet<KeyCode>,
     rotating: bool,
     panning: bool,
@@ -42,6 +45,7 @@ impl Default for Camera {
             speed: 6.0,
             sensitivity: 0.0025,
             exposure_ev: 0.0,
+            orientation: None,
             keys: HashSet::new(),
             rotating: false,
             panning: false,
@@ -51,15 +55,24 @@ impl Default for Camera {
 
 impl Camera {
     pub fn forward(&self) -> Vec3 {
+        if let Some(q) = self.orientation {
+            return (q * Vec3::NEG_Z).normalize();
+        }
         let cp = self.pitch.cos();
         Vec3::new(self.yaw.sin() * cp, self.pitch.sin(), -self.yaw.cos() * cp).normalize()
     }
 
     pub fn right(&self) -> Vec3 {
+        if let Some(q) = self.orientation {
+            return (q * Vec3::X).normalize();
+        }
         self.forward().cross(Vec3::Y).normalize_or_zero()
     }
 
     pub fn up(&self) -> Vec3 {
+        if let Some(q) = self.orientation {
+            return (q * Vec3::Y).normalize();
+        }
         self.right().cross(self.forward()).normalize_or_zero()
     }
 
@@ -73,12 +86,15 @@ impl Camera {
     #[allow(deprecated)]
     pub fn view(&self) -> Mat4 {
         let eye = self.eye();
-        Mat4::look_to_rh(eye, self.forward(), Vec3::Y)
+        let up = if self.orientation.is_some() { self.up() } else { Vec3::Y };
+        Mat4::look_to_rh(eye, self.forward(), up)
     }
 
     #[allow(deprecated)]
     pub fn proj(&self, aspect: f32) -> Mat4 {
-        Mat4::perspective_rh(self.fov_y, aspect.max(0.0001), self.z_near, self.z_far)
+        // Reverse-Z with an infinite far plane: depth 1 at the near plane, 0 at infinity.
+        // Gives near-uniform precision out to tens of kilometres with Depth32Float.
+        Mat4::perspective_infinite_reverse_rh(self.fov_y, aspect.max(0.0001), self.z_near)
     }
 
     pub fn process_event(&mut self, event: &WindowEvent) {

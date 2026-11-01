@@ -1,7 +1,35 @@
 struct LightingUniform {
     params: vec4<f32>,
     params2: vec4<f32>,
+    fog: vec4<f32>,
+    fog_sun: vec4<f32>,
 };
+
+// Exponential height fog with analytic optical depth plus a Mie-like sun lobe.
+fn apply_fog(color: vec3<f32>, world_pos: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
+    if light_u.fog.z < 0.5 {
+        return color;
+    }
+    let cam = globals.camera_pos.xyz;
+    let dist = length(world_pos - cam);
+    let k = max(light_u.fog.y, 1e-7);
+    let dh = world_pos.y - cam.y;
+    let kdh = k * dh;
+    var integral = 1.0;
+    if abs(kdh) > 1e-4 {
+        integral = (1.0 - exp(-kdh)) / kdh;
+    }
+    let tau = light_u.fog.x * exp(-k * max(cam.y, 0.0)) * dist * integral;
+    let amount = min(1.0 - exp(-max(tau, 0.0)), light_u.fog.w);
+    // fog takes the colour of the sky just above the horizon in the same azimuth, so fogged
+    // geometry meets the sky seamlessly; fog_sun.rgb is an optional extra sun-glow tint.
+    let horizon_dir = normalize(vec3<f32>(view_dir.x, max(view_dir.y, 0.004), view_dir.z));
+    var fog_color = textureSampleLevel(env_tex, env_sampler, horizon_dir, 0.0).rgb;
+    let to_sun = normalize(-globals.sun_dir.xyz);
+    let mie = pow(max(dot(view_dir, to_sun), 0.0), max(light_u.fog_sun.w, 1.0));
+    fog_color += light_u.fog_sun.rgb * mie;
+    return mix(color, fog_color, amount);
+}
 
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var<storage, read> lights: array<GpuLight>;
@@ -67,9 +95,12 @@ fn shadow_factor(world_pos: vec3<f32>, view_depth: f32, ndotl: f32) -> f32 {
 fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
     let depth = textureSampleLevel(g_depth, g_sampler, in.uv, 0.0);
     let world_pos = reconstruct_world_pos(in.uv, depth, globals.inv_view_proj);
-    let view_dir = normalize(world_pos - globals.camera_pos.xyz);
+    // Reverse-Z with an infinite far plane puts the sky (depth 0) at w = 0, so derive the view
+    // direction from a point at a tiny positive depth instead (~50 km away for near = 5 cm).
+    let dir_pos = reconstruct_world_pos(in.uv, max(depth, 1e-6), globals.inv_view_proj);
+    let view_dir = normalize(dir_pos - globals.camera_pos.xyz);
 
-    if depth >= 1.0 {
+    if depth <= 0.0 {
         return vec4<f32>(textureSampleLevel(env_tex, env_sampler, view_dir, 0.0).rgb, 1.0);
     }
 
@@ -163,5 +194,5 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
     ambient += globals.ambient.rgb * albedo * ao;
 
     let color = lo + ambient + emissive;
-    return vec4<f32>(color, 1.0);
+    return vec4<f32>(apply_fog(color, world_pos, view_dir), 1.0);
 }

@@ -48,6 +48,16 @@ pub struct Settings {
     pub vignette: f32,
     pub ambient: f32,
     pub debug_ssao: bool,
+    /// Far edge of the cascaded shadow range (clamped to camera far plane).
+    pub shadow_distance: f32,
+    pub fog_enabled: bool,
+    /// Extinction coefficient at sea level, per metre.
+    pub fog_density: f32,
+    /// Exponential height falloff of the fog, per metre.
+    pub fog_height_falloff: f32,
+    pub fog_max_opacity: f32,
+    /// Extra in-scattered sun glow added to the fog colour toward the sun.
+    pub fog_sun_glow: f32,
 }
 
 impl Default for Settings {
@@ -77,6 +87,12 @@ impl Default for Settings {
             vignette: 0.35,
             ambient: 0.25,
             debug_ssao: false,
+            shadow_distance: f32::INFINITY,
+            fog_enabled: false,
+            fog_density: 0.00004,
+            fog_height_falloff: 0.00012,
+            fog_max_opacity: 0.97,
+            fog_sun_glow: 0.0,
         }
     }
 }
@@ -170,10 +186,12 @@ impl Renderer {
             params: [scene.sky.turbidity, scene.sky.exposure, 0.0, 0.0],
             inv_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             camera_pos: [0.0; 4],
+            zenith: scene.sky.zenith_color.extend(scene.sky.horizon_falloff).into(),
+            horizon: scene.sky.horizon_color.extend(1.0).into(),
         };
         let ibl = Ibl::new(device, queue, &sky_uniform);
 
-        let color_sampler = material::create_sampler(device, "color-sampler", 1);
+        let color_sampler = material::create_sampler(device, "color-sampler", 16);
         let point_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("point-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -202,6 +220,8 @@ impl Renderer {
             &LightingUniform {
                 params: [1.0, 1.0, 1.0, 1.0],
                 params2: [1.0, (ibl::PREFILTER_MIPS - 1) as f32, 0.0, 1.0],
+                fog: [0.0; 4],
+                fog_sun: [0.0; 4],
             },
         );
         let sky_uniform_buffer = gpu::uniform_buffer(device, "sky-u", &sky_uniform);
@@ -525,6 +545,29 @@ impl Renderer {
     }
 
     pub fn upload_scene(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &mut Scene) {
+        self.update_objects(device, queue, scene);
+        log::info!(
+            "uploaded scene: {} meshes, {} materials, {} objects, {} draws, object_buffer={} bytes",
+            scene.meshes.len(),
+            scene.materials.len(),
+            scene.objects.len(),
+            self.draws.len(),
+            self.objects_buffer.size()
+        );
+        for mat in &mut scene.materials {
+            mat.bind_group = Some(create_material_bind_group(
+                device,
+                &self.material_bgl,
+                mat,
+                &self.color_sampler,
+            ));
+        }
+    }
+
+    /// Re-uploads per-object transforms, material parameters and visibility.
+    /// Cheap enough to call every frame for animated scenes; does not rebuild
+    /// material bind groups (call `upload_scene` after adding materials).
+    pub fn update_objects(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene) {
         let mut object_data = Vec::with_capacity(scene.objects.len());
         let mut draws = Vec::with_capacity(scene.objects.len());
 
@@ -564,8 +607,7 @@ impl Renderer {
             draws.push(Draw {
                 mesh: obj.mesh,
                 material: obj.material,
-                // Index into the packed buffer of *visible* objects, not the scene list:
-                // using the scene index shifted every draw after a hidden object.
+                // Slot indexes the packed (visible-only) object buffer.
                 slot: object_data.len() as u32 - 1,
             });
         }
@@ -601,24 +643,7 @@ impl Renderer {
             queue.write_buffer(&self.object_index_buffer, 0, bytemuck::cast_slice(&indices));
         }
 
-        log::info!(
-            "uploaded scene: {} meshes, {} materials, {} objects, {} draws, object_buffer={} bytes",
-            scene.meshes.len(),
-            scene.materials.len(),
-            scene.objects.len(),
-            draws.len(),
-            self.objects_buffer.size()
-        );
         self.draws = draws;
-
-        for mat in &mut scene.materials {
-            mat.bind_group = Some(create_material_bind_group(
-                device,
-                &self.material_bgl,
-                mat,
-                &self.color_sampler,
-            ));
-        }
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) {
@@ -742,7 +767,7 @@ impl Renderer {
             camera.fov_y,
             aspect,
             camera.z_near,
-            camera.z_far,
+            camera.z_far.min(self.settings.shadow_distance),
             sun_dir,
         );
 
@@ -834,6 +859,18 @@ impl Renderer {
                 self.settings.debug_ssao as u32 as f32,
                 self.settings.ambient,
             ],
+            fog: [
+                self.settings.fog_density,
+                self.settings.fog_height_falloff,
+                self.settings.fog_enabled as u32 as f32,
+                self.settings.fog_max_opacity,
+            ],
+            fog_sun: [
+                scene.sky.sun_color.x * self.settings.fog_sun_glow,
+                scene.sky.sun_color.y * self.settings.fog_sun_glow,
+                scene.sky.sun_color.z * self.settings.fog_sun_glow,
+                8.0,
+            ],
         };
         queue.write_buffer(
             &self.lighting_uniform_buffer,
@@ -849,6 +886,8 @@ impl Renderer {
             params: [scene.sky.turbidity, scene.sky.exposure, 0.0, 0.0],
             inv_view_proj: inv_view_proj.to_cols_array_2d(),
             camera_pos: [eye.x, eye.y, eye.z, 1.0],
+            zenith: scene.sky.zenith_color.extend(scene.sky.horizon_falloff).into(),
+            horizon: scene.sky.horizon_color.extend(1.0).into(),
         };
         queue.write_buffer(&self.sky_uniform_buffer, 0, bytemuck::bytes_of(&sky));
 
@@ -944,7 +983,7 @@ impl Renderer {
             camera.fov_y,
             aspect,
             camera.z_near,
-            camera.z_far,
+            camera.z_far.min(self.settings.shadow_distance),
             sun_dir,
             self.shadow.size,
         )
@@ -1011,7 +1050,7 @@ impl Renderer {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &self.targets.depth.view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: wgpu::LoadOp::Clear(0.0),
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -1609,7 +1648,7 @@ fn create_geometry_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_compare: wgpu::CompareFunction::GreaterEqual,
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),

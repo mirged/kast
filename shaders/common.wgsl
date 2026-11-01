@@ -181,11 +181,13 @@ fn tonemap(x: vec3<f32>, mode: u32) -> vec3<f32> {
 }
 
 fn sky_color(dir_in: vec3<f32>, sun_dir: vec3<f32>, sun_color: vec3<f32>) -> vec3<f32> {
+    return sky_color_ext(dir_in, sun_dir, sun_color, vec3<f32>(0.09, 0.19, 0.42), vec3<f32>(0.62, 0.70, 0.82), 5.0);
+}
+
+fn sky_color_ext(dir_in: vec3<f32>, sun_dir: vec3<f32>, sun_color: vec3<f32>, zenith: vec3<f32>, horizon: vec3<f32>, falloff: f32) -> vec3<f32> {
     let dir = normalize(dir_in);
-    let zenith = vec3<f32>(0.09, 0.19, 0.42);
-    let horizon = vec3<f32>(0.62, 0.70, 0.82);
     let up = max(dir.y, 0.0);
-    let t = pow(1.0 - up, 5.0);
+    let t = pow(1.0 - up, max(falloff, 0.5));
     var sky = mix(zenith, horizon, t);
     let sun_amount = max(dot(dir, sun_dir), 0.0);
     sky += sun_color * pow(sun_amount, 8.0) * 0.4;
