@@ -136,6 +136,7 @@ pub struct Renderer {
     objects_bind_group: wgpu::BindGroup,
     objects_bgl: wgpu::BindGroupLayout,
     draws: Vec<Draw>,
+    shadow_draws: Vec<Draw>,
 
     #[allow(dead_code)]
     geometry_globals_bgl: wgpu::BindGroupLayout,
@@ -516,6 +517,7 @@ impl Renderer {
             objects_bind_group,
             objects_bgl,
             draws: Vec::new(),
+            shadow_draws: Vec::new(),
             geometry_globals_bgl,
             geometry_globals_bg,
             material_bgl,
@@ -570,6 +572,7 @@ impl Renderer {
     pub fn update_objects(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene) {
         let mut object_data = Vec::with_capacity(scene.objects.len());
         let mut draws = Vec::with_capacity(scene.objects.len());
+        let mut shadow_draws = Vec::with_capacity(scene.objects.len());
 
         for obj in scene.objects.iter() {
             if !obj.visible {
@@ -579,10 +582,11 @@ impl Renderer {
             let normal_matrix = obj.transform.inverse().transpose();
             let d = &mat.desc;
 
+            let dither = d.dithered || obj.alpha < 0.999;
             object_data.push(ObjectData {
                 model: obj.transform.to_cols_array_2d(),
                 normal_matrix: normal_matrix.to_cols_array_2d(),
-                base_color: d.base_color,
+                base_color: [d.base_color[0], d.base_color[1], d.base_color[2], d.base_color[3] * obj.alpha],
                 emissive: [
                     d.emissive[0],
                     d.emissive[1],
@@ -601,9 +605,16 @@ impl Renderer {
                     mat.has_occlusion as u32,
                     d.unlit as u32,
                     d.double_sided as u32,
-                    0,
+                    dither as u32,
                 ],
             });
+            if obj.cast_shadows {
+                shadow_draws.push(Draw {
+                    mesh: obj.mesh,
+                    material: obj.material,
+                    slot: object_data.len() as u32 - 1,
+                });
+            }
             draws.push(Draw {
                 mesh: obj.mesh,
                 material: obj.material,
@@ -644,6 +655,7 @@ impl Renderer {
         }
 
         self.draws = draws;
+        self.shadow_draws = shadow_draws;
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) {
@@ -1014,7 +1026,7 @@ impl Renderer {
                 &[(layer * shadow::SHADOW_STRIDE as u32)],
             );
             pass.set_bind_group(1, &self.objects_bind_group, &[]);
-            self.draw_objects(&mut pass, scene, &self.object_index_buffer);
+            self.draw_objects(&mut pass, scene, &self.object_index_buffer, &self.shadow_draws);
         }
     }
 
@@ -1061,7 +1073,7 @@ impl Renderer {
         pass.set_pipeline(&self.geometry_pipeline);
         pass.set_bind_group(0, &self.geometry_globals_bg, &[]);
         pass.set_bind_group(1, &self.objects_bind_group, &[]);
-        self.draw_objects(&mut pass, scene, &self.object_index_buffer);
+        self.draw_objects(&mut pass, scene, &self.object_index_buffer, &self.draws);
     }
 
     fn draw_objects<'a>(
@@ -1069,8 +1081,9 @@ impl Renderer {
         pass: &mut wgpu::RenderPass<'a>,
         scene: &'a Scene,
         index_buffer: &'a wgpu::Buffer,
+        list: &'a [Draw],
     ) {
-        for draw in &self.draws {
+        for draw in list {
             let mesh = &scene.meshes[draw.mesh];
             let material = &scene.materials[draw.material];
             if let Some(bg) = &material.bind_group {

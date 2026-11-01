@@ -98,6 +98,9 @@ pub struct MaterialDesc {
     pub uv_offset: [f32; 2],
     pub double_sided: bool,
     pub unlit: bool,
+    /// Treat base-colour/texture alpha as coverage via ordered dithering (fake transparency
+    /// for the deferred pipeline: glass, smoke, cloud edges).
+    pub dithered: bool,
 }
 
 impl Default for MaterialDesc {
@@ -115,6 +118,7 @@ impl Default for MaterialDesc {
             uv_offset: [0.0, 0.0],
             double_sided: false,
             unlit: false,
+            dithered: false,
         }
     }
 }

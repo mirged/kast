@@ -72,7 +72,7 @@ pub struct ObjectData {
     pub uv_transform: [f32; 4],
     /// x = has albedo, y = has normal, z = has mr, w = has emissive
     pub flags0: [u32; 4],
-    /// x = has ao, y = unlit, z = double_sided, w = unused
+    /// x = has ao, y = unlit, z = double_sided, w = dithered transparency
     pub flags1: [u32; 4],
 }
 

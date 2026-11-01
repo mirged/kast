@@ -122,6 +122,11 @@ pub struct SceneObject {
     pub material: usize,
     pub transform: Mat4,
     pub visible: bool,
+    /// Per-object opacity multiplier. Below 1 the object is drawn with ordered-dither
+    /// (screen-door) transparency in the deferred pass.
+    pub alpha: f32,
+    /// Whether the object is rendered into the shadow cascades.
+    pub cast_shadows: bool,
 }
 
 impl SceneObject {
@@ -131,6 +136,8 @@ impl SceneObject {
             material,
             transform,
             visible: true,
+            alpha: 1.0,
+            cast_shadows: true,
         }
     }
 }

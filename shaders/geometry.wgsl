@@ -95,6 +95,18 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> FsOut {
     if obj.material.w > 0.0 && base_alpha < obj.material.w {
         discard;
     }
+    // Ordered-dither (screen-door) transparency for the deferred path. The 4x4 Bayer pattern is
+    // offset per object so overlapping translucent objects don't hide each other identically.
+    if obj.flags1.w == 1u {
+        let o = in.obj_index * 7u;
+        let px = (u32(in.clip.x) + o) & 3u;
+        let py = (u32(in.clip.y) + (o >> 2u)) & 3u;
+        var bayer = array<f32, 16>(0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+        let threshold = (bayer[py * 4u + px] + 0.5) / 16.0;
+        if base_alpha < threshold {
+            discard;
+        }
+    }
 
     var out: FsOut;
     if obj.flags1.y == 1u {
