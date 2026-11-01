@@ -528,7 +528,7 @@ impl Renderer {
         let mut object_data = Vec::with_capacity(scene.objects.len());
         let mut draws = Vec::with_capacity(scene.objects.len());
 
-        for (i, obj) in scene.objects.iter().enumerate() {
+        for obj in scene.objects.iter() {
             if !obj.visible {
                 continue;
             }
@@ -564,7 +564,9 @@ impl Renderer {
             draws.push(Draw {
                 mesh: obj.mesh,
                 material: obj.material,
-                slot: i as u32,
+                // Index into the packed buffer of *visible* objects, not the scene list:
+                // using the scene index shifted every draw after a hidden object.
+                slot: object_data.len() as u32 - 1,
             });
         }
 
