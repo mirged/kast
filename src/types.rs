@@ -74,6 +74,8 @@ pub struct ObjectData {
     pub flags0: [u32; 4],
     /// x = has ao, y = unlit, z = double_sided, w = dithered transparency
     pub flags1: [u32; 4],
+    /// x = detail wavelength (metres, 0 = off), y = strength, z = animate with time
+    pub detail: [f32; 4],
 }
 
 #[repr(C)]

@@ -101,7 +101,15 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
     let view_dir = normalize(dir_pos - globals.camera_pos.xyz);
 
     if depth <= 0.0 {
-        return vec4<f32>(textureSampleLevel(env_tex, env_sampler, view_dir, 0.0).rgb, 1.0);
+        // sky: the baked environment cube, plus an analytic sun disc and its glow so the sun is
+        // crisp at any resolution (the cube face is only 256 px across).
+        var sky = textureSampleLevel(env_tex, env_sampler, view_dir, 0.0).rgb;
+        let to_sun = normalize(-globals.sun_dir.xyz);
+        let d = max(dot(view_dir, to_sun), 0.0);
+        let disc = smoothstep(0.99985, 0.99995, d);
+        let glow = pow(d, 900.0) * 1.2 + pow(d, 24.0) * 0.10;
+        sky += globals.sun_color.rgb * (disc * 24.0 + glow);
+        return vec4<f32>(sky, 1.0);
     }
 
     let albedo_metal = textureSampleLevel(g_albedo, g_sampler, in.uv, 0.0);

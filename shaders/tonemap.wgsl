@@ -19,6 +19,9 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 
     color = color * post.params.x;
     color = tonemap(color, u32(post.modes.x));
+    // gentle grade: a touch more colour, so greens and water read as such through the haze
+    let lum = luminance(color);
+    color = clamp(mix(vec3<f32>(lum), color, 1.16), vec3<f32>(0.0), vec3<f32>(1.0));
 
     if post.modes.w > 0.5 {
         color = linear_to_srgb(color);
