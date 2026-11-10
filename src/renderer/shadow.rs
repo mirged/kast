@@ -10,6 +10,8 @@ pub struct Shadow {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
     pub sampler: wgpu::Sampler,
+    /// Non-comparison sampler, used by the PCSS blocker search to read raw map depth.
+    pub depth_sampler: wgpu::Sampler,
     pub layout: wgpu::BindGroupLayout,
     pub bind_group: wgpu::BindGroup,
     pub matrix_buffer: wgpu::Buffer,
@@ -54,6 +56,23 @@ impl Shadow {
             border_color: None,
         });
 
+        // Depth textures cannot be sampled with a filtering sampler, and the blocker search
+        // needs the stored depth rather than a comparison result.
+        let depth_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow-depth-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 0.0,
+            compare: None,
+            anisotropy_clamp: 1,
+            border_color: None,
+        });
+
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shadow-bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -92,6 +111,7 @@ impl Shadow {
             texture,
             view,
             sampler,
+            depth_sampler,
             layout,
             bind_group,
             matrix_buffer,

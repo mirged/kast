@@ -39,6 +39,9 @@ pub struct Settings {
     pub ssao_bias: f32,
     pub shadows_enabled: bool,
     pub shadow_strength: f32,
+    /// Penumbra growth of sun shadows: metres of blur per metre of gap between blocker and
+    /// receiver, i.e. how large the sun is treated as. 0 leaves a fixed one-texel filter.
+    pub shadow_softness: f32,
     pub ibl_enabled: bool,
     pub ibl_intensity: f32,
     pub ssr_enabled: bool,
@@ -78,6 +81,7 @@ impl Default for Settings {
             ssao_bias: 0.025,
             shadows_enabled: true,
             shadow_strength: 1.0,
+            shadow_softness: 0.02,
             ibl_enabled: true,
             ibl_intensity: 1.0,
             ssr_enabled: true,
@@ -925,7 +929,7 @@ impl Renderer {
         globals.shadow_texel = [
             1.0 / self.shadow.size as f32,
             self.shadow.size as f32,
-            0.0,
+            self.settings.shadow_softness.max(0.0),
             0.0,
         ];
         for (i, m) in self
@@ -1586,6 +1590,11 @@ fn create_lighting_layout_g0(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 wgpu::ShaderStages::VERTEX_FRAGMENT,
                 float(),
                 wgpu::TextureViewDimension::Cube,
+            ),
+            sampler_entry(
+                10,
+                wgpu::ShaderStages::FRAGMENT,
+                wgpu::SamplerBindingType::NonFiltering,
             ),
         ],
     })
@@ -2380,6 +2389,10 @@ fn build_lighting_g0(
             wgpu::BindGroupEntry {
                 binding: 9,
                 resource: wgpu::BindingResource::TextureView(&ibl.env_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::Sampler(&shadow.depth_sampler),
             },
         ],
     })

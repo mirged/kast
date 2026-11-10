@@ -19,6 +19,7 @@ pub struct Globals {
     pub light_meta: [u32; 4],
     pub time: [f32; 4],
     pub shadow_splits: [f32; 4],
+    /// x = 1 / shadow-map size, y = shadow-map size, z = PCSS softness, w unused
     pub shadow_texel: [f32; 4],
     pub cascade_matrices: [[[f32; 4]; 4]; CASCADE_COUNT],
 }

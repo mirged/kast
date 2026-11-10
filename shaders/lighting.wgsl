@@ -49,6 +49,8 @@ fn apply_fog(color: vec3<f32>, world_pos: vec3<f32>, view_dir: vec3<f32>) -> vec
 @group(1) @binding(4) var g_sampler: sampler;
 @group(1) @binding(5) var ssao_tex: texture_2d<f32>;
 
+@group(0) @binding(10) var shadow_depth_sampler: sampler;
+
 fn point_attenuation(dist: f32, range: f32) -> f32 {
     let d2 = max(dist * dist, 1e-4);
     let window = clamp(1.0 - pow(dist / max(range, 1e-3), 4.0), 0.0, 1.0);
@@ -66,29 +68,89 @@ fn cascade_index(view_depth: f32) -> i32 {
     return 3;
 }
 
-fn shadow_factor(world_pos: vec3<f32>, view_depth: f32, ndotl: f32) -> f32 {
-    let cascade = cascade_index(view_depth);
-    let lp = globals.cascade_matrices[u32(cascade)] * vec4<f32>(world_pos, 1.0);
-    if lp.w <= 0.0 {
-        return 1.0;
-    }
+/// World size of one shadow-map texel for `cascade`, in metres.
+fn cascade_texel_world(cascade: u32) -> f32 {
+    let m = globals.cascade_matrices[cascade];
+    // The orthographic projection maps the cascade's light-space extent onto [-1, 1], so the
+    // length of the first row is 2 / width.
+    let sx = length(vec3<f32>(m[0].x, m[1].x, m[2].x));
+    return 2.0 / (max(sx, 1e-9) * globals.shadow_texel.y);
+}
+
+/// Percentage-closer soft shadow in one cascade: search for the average blocker, then filter
+/// with a radius that grows with the blocker-to-receiver gap. Contact shadows stay crisp while
+/// shadows from high blockers soften, and the cost is 28 taps instead of the usual 9.
+fn cascade_shadow(world_pos: vec3<f32>, normal: vec3<f32>, cascade: u32, ndotl: f32) -> f32 {
+    let m = globals.cascade_matrices[cascade];
+    let texel = globals.shadow_texel.x;
+    let sx = length(vec3<f32>(m[0].x, m[1].x, m[2].x)); // 2 / width
+    let sz = length(vec3<f32>(m[0].z, m[1].z, m[2].z)); // 2 / (far - near)
+    // Normal offset: step the receiver off its own surface by about a texel at grazing
+    // angles. It kills acne that a constant depth bias would need a much larger value for,
+    // which would detach contact shadows.
+    let offset = min(cascade_texel_world(cascade) * 1.5 * (1.0 - ndotl), 0.5);
+    let lp = m * vec4<f32>(world_pos + normal * offset, 1.0);
     let ndc = lp.xyz / lp.w;
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0 {
         return 1.0;
     }
-    let texel = globals.shadow_texel.x;
-    let bias = max(0.0012 * (1.0 - ndotl), 0.00025);
-    let reference = ndc.z - bias;
-    let layer = u32(cascade);
-    var sum = 0.0;
-    for (var y = -1; y <= 1; y = y + 1) {
-        for (var x = -1; x <= 1; x = x + 1) {
-            let offset = vec2<f32>(f32(x), f32(y)) * texel;
-            sum += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + offset, layer, reference);
+    let reference = ndc.z - max(0.0006 * (1.0 - ndotl), 0.00012);
+
+    // Blocker search over a small disc; no blocker means the texel is fully lit.
+    var blocker_sum = 0.0;
+    var blockers = 0.0;
+    let search = 6.0 * texel;
+    for (var i = 0; i < 12; i = i + 1) {
+        let a = f32(i) * 2.399963;
+        let r = sqrt((f32(i) + 0.5) / 12.0);
+        let d = textureSampleLevel(
+            shadow_map,
+            shadow_depth_sampler,
+            uv + vec2<f32>(cos(a), sin(a)) * r * search,
+            cascade,
+            0.0,
+        );
+        if d > 0.0 && d < reference {
+            blocker_sum = blocker_sum + d;
+            blockers = blockers + 1.0;
         }
     }
-    return sum / 9.0;
+    if blockers < 0.5 {
+        return 1.0;
+    }
+
+    // Penumbra from the light's angular size: gap along the light axis, converted from
+    // depth-ndc to metres, times Settings::shadow_softness. Clamped so a distant blocker
+    // cannot open a filter wider than the map can resolve.
+    let gap = max(reference - blocker_sum / blockers, 0.0) / max(sz, 1e-9);
+    let radius = clamp(gap * globals.shadow_texel.z * sx * 0.5, texel, 24.0 * texel);
+
+    var sum = 0.0;
+    for (var i = 0; i < 16; i = i + 1) {
+        let a = f32(i) * 2.399963;
+        let r = sqrt((f32(i) + 0.5) / 16.0);
+        let offset = vec2<f32>(cos(a), sin(a)) * r * radius;
+        sum += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + offset, cascade, reference);
+    }
+    return sum / 16.0;
+}
+
+fn shadow_factor(world_pos: vec3<f32>, normal: vec3<f32>, view_depth: f32, ndotl: f32) -> f32 {
+    let cascade = cascade_index(view_depth);
+    let here = cascade_shadow(world_pos, normal, u32(cascade), ndotl);
+    if cascade >= 3 {
+        return here;
+    }
+    // Cross-fade into the next cascade over the last tenth of this one, so the resolution
+    // change at a split does not show as a line across the ground.
+    let upper = globals.shadow_splits[cascade];
+    let blend_from = upper * 0.9;
+    if view_depth <= blend_from {
+        return here;
+    }
+    let next = cascade_shadow(world_pos, normal, u32(cascade) + 1u, ndotl);
+    return mix(here, next, smoothstep(blend_from, upper, view_depth));
 }
 
 @fragment
@@ -167,7 +229,7 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
         var shadow = 1.0;
         if kind < 0.5 && light_u.params.y > 0.5 {
             let world_view_depth = -(globals.view * vec4<f32>(world_pos, 1.0)).z;
-            shadow = shadow_factor(world_pos, world_view_depth, n_dot_l);
+            shadow = shadow_factor(world_pos, normal, world_view_depth, n_dot_l);
             shadow = mix(1.0, shadow, light_u.params2.x);
         }
 

@@ -16,6 +16,7 @@ struct Globals {
     light_meta: vec4<u32>,
     time: vec4<f32>,
     shadow_splits: vec4<f32>,
+    /// x = 1 / shadow-map size, y = shadow-map size, z = PCSS softness
     shadow_texel: vec4<f32>,
     cascade_matrices: array<mat4x4<f32>, 4>,
 };
