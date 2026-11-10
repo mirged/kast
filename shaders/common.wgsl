@@ -16,6 +16,7 @@ struct Globals {
     light_meta: vec4<u32>,
     time: vec4<f32>,
     shadow_splits: vec4<f32>,
+    /// x = 1 / shadow-map size, y = shadow-map size, z = PCSS softness
     shadow_texel: vec4<f32>,
     cascade_matrices: array<mat4x4<f32>, 4>,
 };
@@ -36,6 +37,8 @@ struct ObjectData {
     uv_transform: vec4<f32>,
     flags0: vec4<u32>,
     flags1: vec4<u32>,
+    /// x: detail wavelength (metres, 0 = off), y: strength, z: animate with time
+    detail: vec4<f32>,
 };
 
 struct FullscreenOut {
@@ -181,16 +184,82 @@ fn tonemap(x: vec3<f32>, mode: u32) -> vec3<f32> {
 }
 
 fn sky_color(dir_in: vec3<f32>, sun_dir: vec3<f32>, sun_color: vec3<f32>) -> vec3<f32> {
+    return sky_color_ext(dir_in, sun_dir, sun_color, vec3<f32>(0.09, 0.19, 0.42), vec3<f32>(0.62, 0.70, 0.82), 5.0);
+}
+
+fn sky_color_ext(dir_in: vec3<f32>, sun_dir: vec3<f32>, sun_color: vec3<f32>, zenith: vec3<f32>, horizon: vec3<f32>, falloff: f32) -> vec3<f32> {
     let dir = normalize(dir_in);
-    let zenith = vec3<f32>(0.09, 0.19, 0.42);
-    let horizon = vec3<f32>(0.62, 0.70, 0.82);
     let up = max(dir.y, 0.0);
-    let t = pow(1.0 - up, 5.0);
+    let t = pow(1.0 - up, max(falloff, 0.5));
     var sky = mix(zenith, horizon, t);
     let sun_amount = max(dot(dir, sun_dir), 0.0);
     sky += sun_color * pow(sun_amount, 8.0) * 0.4;
     sky += sun_color * smoothstep(0.9995, 0.9999, sun_amount) * 60.0;
-    let ground = mix(horizon * 0.35, vec3<f32>(0.04, 0.035, 0.03), clamp(-dir.y * 3.0, 0.0, 1.0));
-    sky = select(ground, sky, dir.y > 0.0);
+    // blend into the ground half instead of switching at dir.y == 0, which otherwise leaves a
+    // hard pale line across the sky exactly at the horizon
+    let ground = mix(horizon * 0.80, vec3<f32>(0.045, 0.040, 0.035), clamp(-dir.y * 2.5, 0.0, 1.0));
+    sky = mix(sky, ground, clamp(-dir.y * 14.0, 0.0, 1.0));
     return max(sky, vec3<f32>(0.0));
+}
+
+// ---- procedural surface detail ------------------------------------------------------------
+// Value noise + a 3-octave sum, used to perturb shading normals from world position so ground,
+// rock and water get micro-relief without a second UV set or another texture fetch.
+fn hash21(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453123);
+}
+
+fn value_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash21(i);
+    let b = hash21(i + vec2<f32>(1.0, 0.0));
+    let c = hash21(i + vec2<f32>(0.0, 1.0));
+    let d = hash21(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn detail_fbm(p: vec2<f32>) -> f32 {
+    return 0.52 * value_noise(p)
+        + 0.30 * value_noise(p * 2.17 + vec2<f32>(3.1, 1.7))
+        + 0.18 * value_noise(p * 4.43 + vec2<f32>(7.3, 5.1));
+}
+
+/// Perturb `n0` with the gradient of the detail field. `d` is (wavelength, strength, animate).
+fn apply_detail(world_pos: vec3<f32>, view_depth: f32, n0: vec3<f32>, d: vec4<f32>, time: f32) -> vec3<f32> {
+    if d.x <= 0.0 || d.y <= 0.0 {
+        return n0;
+    }
+    var p = world_pos.xz / d.x;
+    if d.z > 0.5 {
+        p = p + vec2<f32>(time * 0.45, time * 0.26);
+    }
+    let e = 0.12;
+    let h0 = detail_fbm(p);
+    let gx = (detail_fbm(p + vec2<f32>(e, 0.0)) - h0) / e;
+    let gz = (detail_fbm(p + vec2<f32>(0.0, e)) - h0) / e;
+    let up = vec3<f32>(0.0, 1.0, 0.0);
+    var t = cross(up, n0);
+    if length(t) < 1e-3 {
+        t = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    t = normalize(t);
+    let b = cross(n0, t);
+    // fade out where a texel spans many ripples, otherwise it shimmers
+    let fade = 1.0 - smoothstep(400.0, 5000.0, view_depth);
+    var n1 = n0 - d.y * fade * 0.06 * (t * gx + b * gz);
+    // a second, much finer octave that only shows close up (grass blades, gravel, ripples)
+    let near_fade = 1.0 - smoothstep(20.0, 180.0, view_depth);
+    if near_fade > 0.0 {
+        var q = world_pos.xz / max(d.x * 0.09, 0.12);
+        if d.z > 0.5 {
+            q = q + vec2<f32>(time * 0.9, time * 0.5);
+        }
+        let g0 = detail_fbm(q);
+        let qx = (detail_fbm(q + vec2<f32>(e, 0.0)) - g0) / e;
+        let qz = (detail_fbm(q + vec2<f32>(0.0, e)) - g0) / e;
+        n1 = n1 - d.y * near_fade * 0.035 * (t * qx + b * qz);
+    }
+    return normalize(n1);
 }

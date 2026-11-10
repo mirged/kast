@@ -22,7 +22,7 @@ fn hash12(p: vec2<f32>) -> f32 {
 fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
     let source = textureSampleLevel(hdr_tex, tex_sampler, in.uv, 0.0);
     let depth = textureSampleLevel(depth_tex, tex_sampler, in.uv, 0.0);
-    if depth >= 1.0 {
+    if depth <= 0.0 {
         return vec4<f32>(source.rgb, 1.0);
     }
 

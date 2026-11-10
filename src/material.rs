@@ -98,6 +98,19 @@ pub struct MaterialDesc {
     pub uv_offset: [f32; 2],
     pub double_sided: bool,
     pub unlit: bool,
+    /// Treat base-colour/texture alpha as coverage via ordered dithering (fake transparency
+    /// for the deferred pipeline: glass, smoke, cloud edges).
+    pub dithered: bool,
+    /// Wavelength in metres of the procedural micro-relief applied in the lighting pass
+    /// (0 disables it). Adds surface grain without a second UV set.
+    pub detail_scale: f32,
+    /// Steepness of that micro-relief (0.3 subtle, 1.0 strong).
+    pub detail_strength: f32,
+    /// Scroll the detail pattern with time — water ripples.
+    pub detail_anim: f32,
+    /// Draw in the forward pass with real alpha blending (glass, clouds, smoke) instead of the
+    /// deferred path, which can only dither.
+    pub transparent: bool,
 }
 
 impl Default for MaterialDesc {
@@ -115,6 +128,11 @@ impl Default for MaterialDesc {
             uv_offset: [0.0, 0.0],
             double_sided: false,
             unlit: false,
+            dithered: false,
+            detail_scale: 0.0,
+            detail_strength: 0.0,
+            detail_anim: 0.0,
+            transparent: false,
         }
     }
 }

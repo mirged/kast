@@ -21,6 +21,11 @@ struct Draw {
     mesh: usize,
     material: usize,
     slot: u32,
+    /// World-space origin, used to sort the forward transparent pass back to front.
+    origin: [f32; 3],
+    /// World-space bounding sphere, for frustum and shadow-range culling.
+    center: [f32; 3],
+    radius: f32,
 }
 
 pub struct Settings {
@@ -34,6 +39,9 @@ pub struct Settings {
     pub ssao_bias: f32,
     pub shadows_enabled: bool,
     pub shadow_strength: f32,
+    /// Penumbra growth of sun shadows: metres of blur per metre of gap between blocker and
+    /// receiver, i.e. how large the sun is treated as. 0 leaves a fixed one-texel filter.
+    pub shadow_softness: f32,
     pub ibl_enabled: bool,
     pub ibl_intensity: f32,
     pub ssr_enabled: bool,
@@ -48,6 +56,16 @@ pub struct Settings {
     pub vignette: f32,
     pub ambient: f32,
     pub debug_ssao: bool,
+    /// Far edge of the cascaded shadow range (clamped to camera far plane).
+    pub shadow_distance: f32,
+    pub fog_enabled: bool,
+    /// Extinction coefficient at sea level, per metre.
+    pub fog_density: f32,
+    /// Exponential height falloff of the fog, per metre.
+    pub fog_height_falloff: f32,
+    pub fog_max_opacity: f32,
+    /// Extra in-scattered sun glow added to the fog colour toward the sun.
+    pub fog_sun_glow: f32,
 }
 
 impl Default for Settings {
@@ -63,6 +81,7 @@ impl Default for Settings {
             ssao_bias: 0.025,
             shadows_enabled: true,
             shadow_strength: 1.0,
+            shadow_softness: 0.02,
             ibl_enabled: true,
             ibl_intensity: 1.0,
             ssr_enabled: true,
@@ -77,6 +96,12 @@ impl Default for Settings {
             vignette: 0.35,
             ambient: 0.25,
             debug_ssao: false,
+            shadow_distance: f32::INFINITY,
+            fog_enabled: false,
+            fog_density: 0.00004,
+            fog_height_falloff: 0.00012,
+            fog_max_opacity: 0.97,
+            fog_sun_glow: 0.0,
         }
     }
 }
@@ -120,12 +145,18 @@ pub struct Renderer {
     objects_bind_group: wgpu::BindGroup,
     objects_bgl: wgpu::BindGroupLayout,
     draws: Vec<Draw>,
+    shadow_draws: Vec<Draw>,
+    transparent_draws: Vec<Draw>,
+    /// `draws` / `shadow_draws` after culling against the current camera.
+    visible_draws: Vec<Draw>,
+    visible_shadow_draws: Vec<Draw>,
 
     #[allow(dead_code)]
     geometry_globals_bgl: wgpu::BindGroupLayout,
     geometry_globals_bg: wgpu::BindGroup,
     material_bgl: wgpu::BindGroupLayout,
     lighting_g0: wgpu::BindGroup,
+    lighting_g0_layout: wgpu::BindGroupLayout,
 
     color_sampler: wgpu::Sampler,
     point_sampler: wgpu::Sampler,
@@ -135,6 +166,7 @@ pub struct Renderer {
     ssao_pipeline: wgpu::RenderPipeline,
     ssao_blur_pipeline: wgpu::RenderPipeline,
     lighting_pipeline: wgpu::RenderPipeline,
+    transparent_pipeline: wgpu::RenderPipeline,
     ssr_pipeline: wgpu::RenderPipeline,
     bloom_prefilter: wgpu::RenderPipeline,
     bloom_downsample: wgpu::RenderPipeline,
@@ -170,10 +202,12 @@ impl Renderer {
             params: [scene.sky.turbidity, scene.sky.exposure, 0.0, 0.0],
             inv_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             camera_pos: [0.0; 4],
+            zenith: scene.sky.zenith_color.extend(scene.sky.horizon_falloff).into(),
+            horizon: scene.sky.horizon_color.extend(1.0).into(),
         };
         let ibl = Ibl::new(device, queue, &sky_uniform);
 
-        let color_sampler = material::create_sampler(device, "color-sampler", 1);
+        let color_sampler = material::create_sampler(device, "color-sampler", 16);
         let point_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("point-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -202,6 +236,8 @@ impl Renderer {
             &LightingUniform {
                 params: [1.0, 1.0, 1.0, 1.0],
                 params2: [1.0, (ibl::PREFILTER_MIPS - 1) as f32, 0.0, 1.0],
+                fog: [0.0; 4],
+                fog_sun: [0.0; 4],
             },
         );
         let sky_uniform_buffer = gpu::uniform_buffer(device, "sky-u", &sky_uniform);
@@ -373,6 +409,13 @@ impl Renderer {
             wgpu::BlendState::REPLACE,
         );
 
+        let transparent_pipeline = create_transparent_pipeline(
+            device,
+            &lighting_g0_layout,
+            &objects_bgl,
+            &material_bgl,
+        );
+
         let ssr_pipeline = create_screen_pipeline(
             device,
             &create_ssr_layout(device),
@@ -496,10 +539,15 @@ impl Renderer {
             objects_bind_group,
             objects_bgl,
             draws: Vec::new(),
+            shadow_draws: Vec::new(),
+            transparent_draws: Vec::new(),
+            visible_draws: Vec::new(),
+            visible_shadow_draws: Vec::new(),
             geometry_globals_bgl,
             geometry_globals_bg,
             material_bgl,
             lighting_g0,
+            lighting_g0_layout,
             color_sampler,
             point_sampler,
             geometry_pipeline,
@@ -507,6 +555,7 @@ impl Renderer {
             ssao_pipeline,
             ssao_blur_pipeline,
             lighting_pipeline,
+            transparent_pipeline,
             ssr_pipeline,
             bloom_prefilter,
             bloom_downsample,
@@ -525,10 +574,68 @@ impl Renderer {
     }
 
     pub fn upload_scene(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &mut Scene) {
+        self.update_objects(device, queue, scene);
+        log::info!(
+            "uploaded scene: {} meshes, {} materials, {} objects, {} draws, object_buffer={} bytes",
+            scene.meshes.len(),
+            scene.materials.len(),
+            scene.objects.len(),
+            self.draws.len(),
+            self.objects_buffer.size()
+        );
+        for mat in &mut scene.materials {
+            mat.bind_group = Some(create_material_bind_group(
+                device,
+                &self.material_bgl,
+                mat,
+                &self.color_sampler,
+            ));
+        }
+    }
+
+    /// Re-bake the image-based lighting from the scene's current sky. Call this
+    /// when the time of day or weather changes the sky, so a night city is lit
+    /// by a night sky instead of the one the renderer started with.
+    pub fn refresh_environment(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+    ) {
+        let sky_uniform = SkyUniform {
+            sun_direction: scene.sky.sun_direction.extend(1.0).into(),
+            sun_color: (scene.sky.sun_color * scene.sky.sun_intensity)
+                .extend(1.0)
+                .into(),
+            params: [scene.sky.turbidity, scene.sky.exposure, 0.0, 0.0],
+            inv_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            camera_pos: [0.0; 4],
+            zenith: scene.sky.zenith_color.extend(scene.sky.horizon_falloff).into(),
+            horizon: scene.sky.horizon_color.extend(1.0).into(),
+        };
+        self.ibl = Ibl::new(device, queue, &sky_uniform);
+        queue.write_buffer(&self.sky_uniform_buffer, 0, bytemuck::bytes_of(&sky_uniform));
+        self.lighting_g0 = build_lighting_g0(
+            device,
+            &self.lighting_g0_layout,
+            &self.globals_buffer,
+            &self.lights_buffer,
+            &self.shadow,
+            &self.ibl,
+            &self.lighting_uniform_buffer,
+        );
+    }
+
+    /// Re-uploads per-object transforms, material parameters and visibility.
+    /// Cheap enough to call every frame for animated scenes; does not rebuild
+    /// material bind groups (call `upload_scene` after adding materials).
+    pub fn update_objects(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene) {
         let mut object_data = Vec::with_capacity(scene.objects.len());
         let mut draws = Vec::with_capacity(scene.objects.len());
+        let mut shadow_draws = Vec::with_capacity(scene.objects.len());
+        let mut transparent_draws = Vec::new();
 
-        for (i, obj) in scene.objects.iter().enumerate() {
+        for obj in scene.objects.iter() {
             if !obj.visible {
                 continue;
             }
@@ -536,10 +643,11 @@ impl Renderer {
             let normal_matrix = obj.transform.inverse().transpose();
             let d = &mat.desc;
 
+            let dither = d.dithered || obj.alpha < 0.999;
             object_data.push(ObjectData {
                 model: obj.transform.to_cols_array_2d(),
                 normal_matrix: normal_matrix.to_cols_array_2d(),
-                base_color: d.base_color,
+                base_color: [d.base_color[0], d.base_color[1], d.base_color[2], d.base_color[3] * obj.alpha],
                 emissive: [
                     d.emissive[0],
                     d.emissive[1],
@@ -558,14 +666,42 @@ impl Renderer {
                     mat.has_occlusion as u32,
                     d.unlit as u32,
                     d.double_sided as u32,
-                    0,
+                    dither as u32,
                 ],
+                detail: [d.detail_scale, d.detail_strength, d.detail_anim, 0.0],
             });
-            draws.push(Draw {
+            let origin = [obj.transform.w_axis.x, obj.transform.w_axis.y, obj.transform.w_axis.z];
+            let (center, radius) = {
+                let m = &scene.meshes[obj.mesh];
+                let c = obj.transform.transform_point3((m.min + m.max) * 0.5);
+                let scale = obj
+                    .transform
+                    .x_axis
+                    .truncate()
+                    .length()
+                    .max(obj.transform.y_axis.truncate().length())
+                    .max(obj.transform.z_axis.truncate().length());
+                ([c.x, c.y, c.z], (m.max - m.min).length() * 0.5 * scale)
+            };
+            // Really transparent materials go to the forward pass; the deferred path can only
+            // dither them.
+            let draw = Draw {
                 mesh: obj.mesh,
                 material: obj.material,
-                slot: i as u32,
-            });
+                // Slot indexes the packed (visible-only) object buffer.
+                slot: object_data.len() as u32 - 1,
+                origin,
+                center,
+                radius,
+            };
+            if d.transparent || obj.alpha < 0.999 {
+                transparent_draws.push(draw);
+                continue;
+            }
+            if obj.cast_shadows {
+                shadow_draws.push(draw);
+            }
+            draws.push(draw);
         }
 
         let object_bytes = bytemuck::cast_slice(&object_data);
@@ -599,24 +735,9 @@ impl Renderer {
             queue.write_buffer(&self.object_index_buffer, 0, bytemuck::cast_slice(&indices));
         }
 
-        log::info!(
-            "uploaded scene: {} meshes, {} materials, {} objects, {} draws, object_buffer={} bytes",
-            scene.meshes.len(),
-            scene.materials.len(),
-            scene.objects.len(),
-            draws.len(),
-            self.objects_buffer.size()
-        );
         self.draws = draws;
-
-        for mat in &mut scene.materials {
-            mat.bind_group = Some(create_material_bind_group(
-                device,
-                &self.material_bgl,
-                mat,
-                &self.color_sampler,
-            ));
-        }
+        self.shadow_draws = shadow_draws;
+        self.transparent_draws = transparent_draws;
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) {
@@ -705,6 +826,7 @@ impl Renderer {
         let aspect = self.targets.size.0 as f32 / self.targets.size.1.max(1) as f32;
         self.update_uniforms(queue, scene, camera, aspect);
         self.update_bloom_uniforms(queue);
+        self.cull(camera, aspect);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame-encoder"),
@@ -716,11 +838,46 @@ impl Renderer {
         self.encode_lighting(&mut encoder);
         self.encode_ssr(&mut encoder);
         self.encode_dof(&mut encoder);
+        self.sort_transparent(camera);
+        self.encode_transparent(&mut encoder, scene);
         self.encode_bloom(&mut encoder);
         self.encode_tonemap(&mut encoder);
         self.encode_fxaa(&mut encoder, present);
 
         queue.submit(Some(encoder.finish()));
+    }
+
+    /// Drop draws whose bounding sphere is outside the view frustum (side planes only: the far
+    /// plane is at infinity) and, for shadows, draws too far away to land in any cascade.
+    /// Very large objects (terrain) are never culled.
+    fn cull(&mut self, camera: &Camera, aspect: f32) {
+        let m = camera.proj(aspect) * camera.view();
+        let rows = [m.row(0), m.row(1), m.row(2), m.row(3)];
+        let norm = |p: glam::Vec4| p / p.truncate().length().max(1e-6);
+        let planes = [
+            norm(rows[3] + rows[0]),
+            norm(rows[3] - rows[0]),
+            norm(rows[3] + rows[1]),
+            norm(rows[3] - rows[1]),
+        ];
+        let eye = camera.eye();
+        let shadow_reach = self.settings.shadow_distance.min(camera.z_far) + 700.0;
+        let in_view = |d: &Draw| -> bool {
+            if d.radius > 8000.0 {
+                return true;
+            }
+            let c = glam::Vec3::from(d.center);
+            planes
+                .iter()
+                .all(|p| p.truncate().dot(c) + p.w >= -d.radius)
+        };
+        self.visible_draws.clear();
+        self.visible_draws
+            .extend(self.draws.iter().copied().filter(|d| in_view(d)));
+        self.visible_shadow_draws.clear();
+        self.visible_shadow_draws.extend(self.shadow_draws.iter().copied().filter(|d| {
+            d.radius > 8000.0 || glam::Vec3::from(d.center).distance(eye) - d.radius < shadow_reach
+        }));
     }
 
     fn update_uniforms(&self, queue: &wgpu::Queue, scene: &Scene, camera: &Camera, aspect: f32) {
@@ -740,7 +897,7 @@ impl Renderer {
             camera.fov_y,
             aspect,
             camera.z_near,
-            camera.z_far,
+            camera.z_far.min(self.settings.shadow_distance),
             sun_dir,
         );
 
@@ -772,7 +929,7 @@ impl Renderer {
         globals.shadow_texel = [
             1.0 / self.shadow.size as f32,
             self.shadow.size as f32,
-            0.0,
+            self.settings.shadow_softness.max(0.0),
             0.0,
         ];
         for (i, m) in self
@@ -832,6 +989,18 @@ impl Renderer {
                 self.settings.debug_ssao as u32 as f32,
                 self.settings.ambient,
             ],
+            fog: [
+                self.settings.fog_density,
+                self.settings.fog_height_falloff,
+                self.settings.fog_enabled as u32 as f32,
+                self.settings.fog_max_opacity,
+            ],
+            fog_sun: [
+                scene.sky.sun_color.x * self.settings.fog_sun_glow,
+                scene.sky.sun_color.y * self.settings.fog_sun_glow,
+                scene.sky.sun_color.z * self.settings.fog_sun_glow,
+                8.0,
+            ],
         };
         queue.write_buffer(
             &self.lighting_uniform_buffer,
@@ -847,6 +1016,8 @@ impl Renderer {
             params: [scene.sky.turbidity, scene.sky.exposure, 0.0, 0.0],
             inv_view_proj: inv_view_proj.to_cols_array_2d(),
             camera_pos: [eye.x, eye.y, eye.z, 1.0],
+            zenith: scene.sky.zenith_color.extend(scene.sky.horizon_falloff).into(),
+            horizon: scene.sky.horizon_color.extend(1.0).into(),
         };
         queue.write_buffer(&self.sky_uniform_buffer, 0, bytemuck::bytes_of(&sky));
 
@@ -887,7 +1058,9 @@ impl Renderer {
 
         let post = PostUniform {
             params: [
-                (2.0_f32).powf(camera.exposure_ev),
+                // the camera's own stop (used by the G-LOC grey-out) plus the art-direction
+                // stop from `Settings::exposure_ev`
+                (2.0_f32).powf(camera.exposure_ev + self.settings.exposure_ev),
                 2.2,
                 if self.settings.bloom_intensity > 0.0 {
                     self.settings.bloom_intensity
@@ -942,7 +1115,7 @@ impl Renderer {
             camera.fov_y,
             aspect,
             camera.z_near,
-            camera.z_far,
+            camera.z_far.min(self.settings.shadow_distance),
             sun_dir,
             self.shadow.size,
         )
@@ -973,7 +1146,7 @@ impl Renderer {
                 &[(layer * shadow::SHADOW_STRIDE as u32)],
             );
             pass.set_bind_group(1, &self.objects_bind_group, &[]);
-            self.draw_objects(&mut pass, scene, &self.object_index_buffer);
+            self.draw_objects(&mut pass, scene, &self.object_index_buffer, &self.visible_shadow_draws);
         }
     }
 
@@ -1009,7 +1182,7 @@ impl Renderer {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &self.targets.depth.view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: wgpu::LoadOp::Clear(0.0),
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -1020,7 +1193,7 @@ impl Renderer {
         pass.set_pipeline(&self.geometry_pipeline);
         pass.set_bind_group(0, &self.geometry_globals_bg, &[]);
         pass.set_bind_group(1, &self.objects_bind_group, &[]);
-        self.draw_objects(&mut pass, scene, &self.object_index_buffer);
+        self.draw_objects(&mut pass, scene, &self.object_index_buffer, &self.visible_draws);
     }
 
     fn draw_objects<'a>(
@@ -1028,8 +1201,9 @@ impl Renderer {
         pass: &mut wgpu::RenderPass<'a>,
         scene: &'a Scene,
         index_buffer: &'a wgpu::Buffer,
+        list: &'a [Draw],
     ) {
-        for draw in &self.draws {
+        for draw in list {
             let mesh = &scene.meshes[draw.mesh];
             let material = &scene.materials[draw.material];
             if let Some(bg) = &material.bind_group {
@@ -1099,6 +1273,52 @@ impl Renderer {
             &self.targets.hdr_a.view,
             "dof",
         );
+    }
+
+    /// Back-to-front order for the forward transparent pass.
+    fn sort_transparent(&mut self, camera: &Camera) {
+        if self.transparent_draws.len() < 2 {
+            return;
+        }
+        let eye = camera.eye();
+        self.transparent_draws.sort_by(|a, b| {
+            let da = (Vec3::from(a.origin) - eye).length_squared();
+            let db = (Vec3::from(b.origin) - eye).length_squared();
+            db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    /// Forward pass for really transparent geometry: alpha blended into the lit HDR target,
+    /// depth tested against the deferred depth buffer, no depth writes.
+    fn encode_transparent(&self, encoder: &mut wgpu::CommandEncoder, scene: &Scene) {
+        if self.transparent_draws.is_empty() {
+            return;
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("transparent-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.targets.hdr_a.view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.targets.depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.transparent_pipeline);
+        pass.set_bind_group(0, &self.lighting_g0, &[]);
+        pass.set_bind_group(1, &self.objects_bind_group, &[]);
+        self.draw_objects(&mut pass, scene, &self.object_index_buffer, &self.transparent_draws);
     }
 
     fn encode_bloom(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -1311,13 +1531,13 @@ fn create_lighting_layout_g0(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         entries: &[
             uniform_entry(
                 0,
-                wgpu::ShaderStages::FRAGMENT,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
                 std::mem::size_of::<Globals>() as u64,
                 false,
             ),
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
@@ -1327,49 +1547,54 @@ fn create_lighting_layout_g0(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             },
             tex_entry(
                 2,
-                wgpu::ShaderStages::FRAGMENT,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
                 wgpu::TextureSampleType::Depth,
                 wgpu::TextureViewDimension::D2Array,
             ),
             sampler_entry(
                 3,
-                wgpu::ShaderStages::FRAGMENT,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
                 wgpu::SamplerBindingType::Comparison,
             ),
             tex_entry(
                 4,
-                wgpu::ShaderStages::FRAGMENT,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
                 float(),
                 wgpu::TextureViewDimension::Cube,
             ),
             tex_entry(
                 5,
-                wgpu::ShaderStages::FRAGMENT,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
                 float(),
                 wgpu::TextureViewDimension::Cube,
             ),
             tex_entry(
                 6,
-                wgpu::ShaderStages::FRAGMENT,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
                 float(),
                 wgpu::TextureViewDimension::D2,
             ),
             sampler_entry(
                 7,
-                wgpu::ShaderStages::FRAGMENT,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
                 wgpu::SamplerBindingType::Filtering,
             ),
             uniform_entry(
                 8,
-                wgpu::ShaderStages::FRAGMENT,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
                 std::mem::size_of::<LightingUniform>() as u64,
                 false,
             ),
             tex_entry(
                 9,
-                wgpu::ShaderStages::FRAGMENT,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
                 float(),
                 wgpu::TextureViewDimension::Cube,
+            ),
+            sampler_entry(
+                10,
+                wgpu::ShaderStages::FRAGMENT,
+                wgpu::SamplerBindingType::NonFiltering,
             ),
         ],
     })
@@ -1607,7 +1832,7 @@ fn create_geometry_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_compare: wgpu::CompareFunction::GreaterEqual,
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -1633,6 +1858,66 @@ fn create_geometry_pipeline(
                     write_mask: wgpu::ColorWrites::ALL,
                 }),
             ],
+        }),
+        multiview: None,
+        cache: None,
+    })
+}
+
+fn create_transparent_pipeline(
+    device: &wgpu::Device,
+    lighting_bgl: &wgpu::BindGroupLayout,
+    objects_bgl: &wgpu::BindGroupLayout,
+    material_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = shader::create(
+        device,
+        "transparent.wgsl",
+        include_str!("../../shaders/transparent.wgsl"),
+    );
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("transparent-pl"),
+        bind_group_layouts: &[lighting_bgl, objects_bgl, material_bgl],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("transparent-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            compilation_options: Default::default(),
+            buffers: &[
+                crate::mesh::Vertex::layout(),
+                crate::mesh::Vertex::instance_layout(),
+            ],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::GreaterEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
         }),
         multiview: None,
         cache: None,
@@ -2104,6 +2389,10 @@ fn build_lighting_g0(
             wgpu::BindGroupEntry {
                 binding: 9,
                 resource: wgpu::BindingResource::TextureView(&ibl.env_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::Sampler(&shadow.depth_sampler),
             },
         ],
     })

@@ -10,10 +10,10 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use crate::camera::Camera;
-use crate::context::GpuContext;
-use crate::renderer::Renderer;
-use crate::scene::{self, Scene};
+use kast::camera::Camera;
+use kast::context::GpuContext;
+use kast::renderer::Renderer;
+use kast::scene::{self, Scene};
 
 pub struct App {
     pub model: Option<PathBuf>,

@@ -4,6 +4,8 @@ struct SkyUniform {
     params: vec4<f32>,
     inv_view_proj: mat4x4<f32>,
     camera_pos: vec4<f32>,
+    zenith: vec4<f32>,
+    horizon: vec4<f32>,
 };
 
 struct IblUniform {
@@ -33,7 +35,7 @@ fn face_dir(face: u32, uv: vec2<f32>) -> vec3<f32> {
 @fragment
 fn fs_env(in: FullscreenOut) -> @location(0) vec4<f32> {
     let dir = face_dir(ibl.face.x, in.uv);
-    let c = sky_color(dir, normalize(sky.sun_direction.xyz), sky.sun_color.rgb * sky.sun_color.a);
+    let c = sky_color_ext(dir, normalize(sky.sun_direction.xyz), sky.sun_color.rgb * sky.sun_color.a, sky.zenith.rgb, sky.horizon.rgb, sky.zenith.a);
     return vec4<f32>(c, 1.0);
 }
 

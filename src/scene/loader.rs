@@ -212,6 +212,11 @@ fn import_material(
         uv_offset: [0.0, 0.0],
         double_sided: material.double_sided(),
         unlit: false,
+        dithered: matches!(material.alpha_mode(), gltf::material::AlphaMode::Blend),
+        detail_scale: 0.0,
+        detail_strength: 0.0,
+        detail_anim: 0.0,
+        transparent: false,
     };
 
     let mut maps = MaterialMaps::default();

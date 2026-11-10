@@ -19,6 +19,7 @@ pub struct Globals {
     pub light_meta: [u32; 4],
     pub time: [f32; 4],
     pub shadow_splits: [f32; 4],
+    /// x = 1 / shadow-map size, y = shadow-map size, z = PCSS softness, w unused
     pub shadow_texel: [f32; 4],
     pub cascade_matrices: [[[f32; 4]; 4]; CASCADE_COUNT],
 }
@@ -72,8 +73,10 @@ pub struct ObjectData {
     pub uv_transform: [f32; 4],
     /// x = has albedo, y = has normal, z = has mr, w = has emissive
     pub flags0: [u32; 4],
-    /// x = has ao, y = unlit, z = double_sided, w = unused
+    /// x = has ao, y = unlit, z = double_sided, w = dithered transparency
     pub flags1: [u32; 4],
+    /// x = detail wavelength (metres, 0 = off), y = strength, z = animate with time
+    pub detail: [f32; 4],
 }
 
 #[repr(C)]
@@ -85,6 +88,10 @@ pub struct SkyUniform {
     pub params: [f32; 4],
     pub inv_view_proj: [[f32; 4]; 4],
     pub camera_pos: [f32; 4],
+    /// rgb = zenith colour, a = horizon falloff exponent
+    pub zenith: [f32; 4],
+    /// rgb = horizon colour
+    pub horizon: [f32; 4],
 }
 
 #[repr(C)]
@@ -94,6 +101,10 @@ pub struct LightingUniform {
     pub params: [f32; 4],
     /// x = shadow strength, y = max mip, z = debug mode, w = ambient intensity
     pub params2: [f32; 4],
+    /// x = fog density (1/m at sea level), y = height falloff (1/m), z = enabled, w = max opacity
+    pub fog: [f32; 4],
+    /// rgb = sun in-scatter tint, a = mie anisotropy exponent
+    pub fog_sun: [f32; 4],
 }
 
 #[repr(C)]

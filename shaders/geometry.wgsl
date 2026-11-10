@@ -61,6 +61,25 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> FsOut {
     if obj.flags0.x == 1u {
         albedo = albedo * albedo_sample.rgb;
     }
+    // Procedural albedo grain: the same field that drives the micro-relief also tints the
+    // colour, so ground that is coarser than its texture texel still reads as material rather
+    // than flat paint. Fades out before it can alias.
+    if obj.detail.y > 0.0 {
+        let g = in.world_pos.xz / max(obj.detail.x * 0.32, 0.4);
+        let v = detail_fbm(g);
+        let fade = 1.0 - smoothstep(250.0, 2500.0, in.view_depth);
+        albedo = albedo * (1.0 + (v - 0.5) * 0.5 * fade * clamp(obj.detail.y, 0.0, 1.0));
+        // close-range grain finer than the albedo texels: tussocks and stones, a few metres
+        // from the camera, so low flight over ground has texture to read speed from
+        let near_fade = 1.0 - smoothstep(25.0, 260.0, in.view_depth);
+        if near_fade > 0.0 && obj.detail.z < 0.5 {
+            let f1 = detail_fbm(in.world_pos.xz * 0.62);
+            let f2 = detail_fbm(in.world_pos.xz * 2.9 + vec2<f32>(11.0, 4.0));
+            let f3 = detail_fbm(in.world_pos.xz * 11.0 + vec2<f32>(3.0, 19.0));
+            let grain = (f1 - 0.5) * 0.30 + (f2 - 0.5) * 0.30 + (f3 - 0.5) * 0.26;
+            albedo = albedo * (1.0 + grain * near_fade * clamp(obj.detail.y, 0.0, 1.0));
+        }
+    }
 
     var metallic = obj.material.x;
     var roughness = obj.material.y;
@@ -90,10 +109,23 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> FsOut {
     if front_facing == false && obj.flags1.z == 1u {
         n = -n;
     }
+    n = apply_detail(in.world_pos, in.view_depth, n, obj.detail, globals.time.x);
 
     let base_alpha = albedo_sample.a * obj.base_color.a;
     if obj.material.w > 0.0 && base_alpha < obj.material.w {
         discard;
+    }
+    // Ordered-dither (screen-door) transparency for the deferred path. The 4x4 Bayer pattern is
+    // offset per object so overlapping translucent objects don't hide each other identically.
+    if obj.flags1.w == 1u {
+        let o = in.obj_index * 7u;
+        let px = (u32(in.clip.x) + o) & 3u;
+        let py = (u32(in.clip.y) + (o >> 2u)) & 3u;
+        var bayer = array<f32, 16>(0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+        let threshold = (bayer[py * 4u + px] + 0.5) / 16.0;
+        if base_alpha < threshold {
+            discard;
+        }
     }
 
     var out: FsOut;

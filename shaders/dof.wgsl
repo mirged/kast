@@ -11,7 +11,7 @@ struct DofUniform {
 
 fn linear_at(uv: vec2<f32>) -> f32 {
     let d = textureSampleLevel(depth_tex, tex_sampler, uv, 0.0);
-    if d >= 1.0 {
+    if d <= 0.0 {
         return 1e6;
     }
     return -reconstruct_view_pos(uv, d, dof.inv_proj).z;

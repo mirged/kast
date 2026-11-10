@@ -93,6 +93,12 @@ pub struct Sky {
     pub turbidity: f32,
     pub ground_color: Vec3,
     pub exposure: f32,
+    /// Sky colour straight up (linear HDR).
+    pub zenith_color: Vec3,
+    /// Sky colour at the horizon (linear HDR).
+    pub horizon_color: Vec3,
+    /// Exponent shaping the zenith→horizon gradient (higher = thinner horizon band).
+    pub horizon_falloff: f32,
 }
 
 impl Default for Sky {
@@ -104,6 +110,9 @@ impl Default for Sky {
             turbidity: 2.4,
             ground_color: Vec3::new(0.12, 0.11, 0.1),
             exposure: 1.0,
+            zenith_color: Vec3::new(0.09, 0.19, 0.42),
+            horizon_color: Vec3::new(0.62, 0.70, 0.82),
+            horizon_falloff: 5.0,
         }
     }
 }
@@ -113,6 +122,11 @@ pub struct SceneObject {
     pub material: usize,
     pub transform: Mat4,
     pub visible: bool,
+    /// Per-object opacity multiplier. Below 1 the object is drawn with ordered-dither
+    /// (screen-door) transparency in the deferred pass.
+    pub alpha: f32,
+    /// Whether the object is rendered into the shadow cascades.
+    pub cast_shadows: bool,
 }
 
 impl SceneObject {
@@ -122,6 +136,8 @@ impl SceneObject {
             material,
             transform,
             visible: true,
+            alpha: 1.0,
+            cast_shadows: true,
         }
     }
 }
