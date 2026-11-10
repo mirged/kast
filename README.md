@@ -14,7 +14,7 @@ built-in demo scene or any glTF 2.0 model, and can also render offscreen to a PN
 
 > Published as **`kast-render`** because the name `kast` is taken on crates.io by an unrelated
 > project. The library crate is still `kast`, so `use kast::...` works unchanged — or alias the
-> dependency: `kast = { version = "0.1", package = "kast-render" }`.
+> dependency: `kast = { version = "0.2", package = "kast-render" }`.
 
 ![The built-in demo scene, rendered headless to PNG](https://raw.githubusercontent.com/mirged/kast/master/docs/screenshot.jpg)
 
@@ -83,7 +83,7 @@ Add the package; the crate is imported as `kast`:
 
 ```toml
 [dependencies]
-kast-render = "0.1"
+kast-render = "0.2"
 ```
 
 `wgpu` and `glam` are re-exported as `kast::wgpu` and `kast::glam`, so you can build against the

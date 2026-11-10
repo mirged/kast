@@ -27,6 +27,23 @@ pub const SHADOW_SIZE: u32 = 2048;
 /// cascade.
 pub const SHADOW_STRIDE: u64 = 256;
 
+/// The camera parameters a cascade set is fitted to.
+///
+/// Bundled into one struct because all four travel together everywhere and because
+/// `compute_cascades` would otherwise take seven positional floats, which is exactly the kind of
+/// signature where the arguments get swapped.
+#[derive(Clone, Copy, Debug)]
+pub struct FrustumFit {
+    /// Vertical field of view in radians.
+    pub fov_y: f32,
+    /// Frame aspect ratio (width / height).
+    pub aspect: f32,
+    /// Camera near plane in metres; the first cascade starts here.
+    pub near: f32,
+    /// Far edge to fit, in metres — the camera's far plane clamped by the shadow range.
+    pub far: f32,
+}
+
 /// The shadow map and everything needed to render into it and sample it.
 pub struct Shadow {
     /// `Depth32Float` array texture, one layer per cascade.
@@ -166,14 +183,10 @@ impl Shadow {
         &self,
         queue: &wgpu::Queue,
         view: Mat4,
-        fov_y: f32,
-        aspect: f32,
-        near: f32,
-        far: f32,
+        fit: FrustumFit,
         sun_dir: Vec3,
     ) -> [f32; 4] {
-        let (matrices, splits) =
-            compute_cascades(view, fov_y, aspect, near, far, sun_dir, self.size);
+        let (matrices, splits) = compute_cascades(view, fit, sun_dir, self.size);
         for (i, m) in matrices.iter().enumerate() {
             queue.write_buffer(
                 &self.matrix_buffer,
@@ -201,23 +214,20 @@ impl Shadow {
 #[allow(deprecated)]
 pub fn compute_cascades(
     view: Mat4,
-    fov_y: f32,
-    aspect: f32,
-    near: f32,
-    far: f32,
+    fit: FrustumFit,
     sun_dir: Vec3,
     size: u32,
 ) -> ([Mat4; CASCADE_COUNT], [f32; 4]) {
     let inv_view = view.inverse();
-    let tan_half = (fov_y * 0.5).tan();
+    let tan_half = (fit.fov_y * 0.5).tan();
     let lambda = 0.6;
 
     let mut splits = [0.0f32; CASCADE_COUNT];
-    for i in 0..CASCADE_COUNT {
+    for (i, split) in splits.iter_mut().enumerate() {
         let p = (i + 1) as f32 / CASCADE_COUNT as f32;
-        let log = near * (far / near).powf(p);
-        let uni = near + (far - near) * p;
-        splits[i] = lambda * log + (1.0 - lambda) * uni;
+        let log = fit.near * (fit.far / fit.near).powf(p);
+        let uni = fit.near + (fit.far - fit.near) * p;
+        *split = lambda * log + (1.0 - lambda) * uni;
     }
 
     let light_dir = sun_dir.normalize();
@@ -228,7 +238,7 @@ pub fn compute_cascades(
     };
 
     let mut matrices = [Mat4::IDENTITY; CASCADE_COUNT];
-    let mut prev = near;
+    let mut prev = fit.near;
     for i in 0..CASCADE_COUNT {
         let n = prev;
         let f = splits[i];
@@ -238,7 +248,7 @@ pub fn compute_cascades(
         let mut idx = 0;
         for d in [n, f] {
             let hh = tan_half * d;
-            let hw = hh * aspect;
+            let hw = hh * fit.aspect;
             for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
                 corners[idx] = Vec3::new(x * hw, y * hh, -d);
                 idx += 1;

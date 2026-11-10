@@ -157,6 +157,12 @@ pub fn plane(size: f32, subdivisions: u32) -> Geometry {
     Geometry::from_parts(&positions, &normals, &uvs, indices)
 }
 
+/// One cube face: centre offset, outward normal, and the face's local right and up axes.
+///
+/// Kept as an alias both to avoid repeating the tuple four times and to name what the four
+/// vectors mean at the call site.
+type CubeFace = ([f32; 3], [f32; 3], [f32; 3], [f32; 3]);
+
 /// An axis-aligned cube centred on the origin with edge length `size`.
 ///
 /// Each face gets its own four vertices so the normals stay hard-edged, and UVs are oriented the
@@ -164,7 +170,7 @@ pub fn plane(size: f32, subdivisions: u32) -> Geometry {
 /// faces.
 pub fn cube(size: f32) -> Geometry {
     let h = size * 0.5;
-    let faces: [([f32; 3], [f32; 3], [f32; 3], [f32; 3]); 6] = [
+    let faces: [CubeFace; 6] = [
         (
             [0.0, 0.0, h],
             [0.0, 0.0, 1.0],

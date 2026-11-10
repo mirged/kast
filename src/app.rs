@@ -175,7 +175,6 @@ impl ApplicationHandler for App {
         match &event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
-                return;
             }
             WindowEvent::KeyboardInput {
                 event: key_event, ..

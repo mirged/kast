@@ -558,12 +558,14 @@ pub fn default_scene(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Scene
     ));
 
     let metals = [gold, copper, chrome, plastic];
-    for i in 0..4 {
-        let angle = i as f32 / 4.0 * 2.0 * PI;
+    // Ring the four metal/dielectric spheres evenly around the checker sphere at the origin.
+    let spacing = 2.0 * PI / metals.len() as f32;
+    for (i, metal) in metals.iter().enumerate() {
+        let angle = i as f32 * spacing;
         let pos = Vec3::new(angle.cos() * 3.2, 1.0, angle.sin() * 3.2);
         scene.objects.push(SceneObject::new(
             sphere,
-            metals[i],
+            *metal,
             Mat4::from_translation(pos) * Mat4::from_scale(Vec3::splat(1.0)),
         ));
     }

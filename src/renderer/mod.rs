@@ -286,6 +286,11 @@ impl Renderer {
     ///
     /// This is the expensive call in the crate: it compiles every WGSL pipeline and generates the
     /// procedural IBL. Do it once per renderer, not per frame.
+    // The eight arguments are the honest description of what a renderer needs: a device, a queue,
+    // a size, a target format, whether that format is sRGB, whether to allocate an offscreen
+    // present target, and the scene whose materials get bind groups. Bundling them into a config
+    // struct would hide that a renderer is not reusable across formats.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -1054,15 +1059,19 @@ impl Renderer {
         let splits = self.shadow.update(
             queue,
             view,
-            camera.fov_y,
-            aspect,
-            camera.z_near,
-            camera.z_far.min(self.settings.shadow_distance),
+            shadow::FrustumFit {
+                fov_y: camera.fov_y,
+                aspect,
+                near: camera.z_near,
+                far: camera.z_far.min(self.settings.shadow_distance),
+            },
             sun_dir,
         );
 
-        let mut globals = Globals::default();
-        globals.view = view.to_cols_array_2d();
+        let mut globals = Globals {
+            view: view.to_cols_array_2d(),
+            ..Globals::default()
+        };
         globals.proj = proj.to_cols_array_2d();
         globals.view_proj = view_proj.to_cols_array_2d();
         globals.inv_view_proj = inv_view_proj.to_cols_array_2d();
@@ -1282,10 +1291,12 @@ impl Renderer {
     ) -> [Mat4; CASCADE_COUNT] {
         shadow::compute_cascades(
             view,
-            camera.fov_y,
-            aspect,
-            camera.z_near,
-            camera.z_far.min(self.settings.shadow_distance),
+            shadow::FrustumFit {
+                fov_y: camera.fov_y,
+                aspect,
+                near: camera.z_near,
+                far: camera.z_far.min(self.settings.shadow_distance),
+            },
             sun_dir,
             self.shadow.size,
         )
@@ -2305,7 +2316,7 @@ fn create_screen_pipeline_inner(
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(fragment_entry),
-        layout: Some(&pl_layout),
+        layout: Some(pl_layout),
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: "vs_fullscreen",
@@ -2496,7 +2507,7 @@ fn build_target_bindings(
 
     let bloom_layout = create_bloom_layout(device);
     let mut bloom_down = Vec::new();
-    for i in 0..BLOOM_LEVELS {
+    for (i, uniform) in bloom_down_uniforms.iter().enumerate() {
         let src = if i == 0 {
             &targets.hdr_a.view
         } else {
@@ -2508,7 +2519,7 @@ fn build_target_bindings(
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: bloom_down_uniforms[i].as_entire_binding(),
+                    resource: uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -2522,7 +2533,12 @@ fn build_target_bindings(
         }));
     }
     let mut bloom_up = Vec::new();
-    for i in 0..BLOOM_LEVELS.saturating_sub(1) {
+    // One fewer upsample than downsample: the last downsample level has no lower level to mix.
+    for (i, uniform) in bloom_up_uniforms
+        .iter()
+        .take(BLOOM_LEVELS.saturating_sub(1))
+        .enumerate()
+    {
         let src = &targets.bloom[i + 1].view;
         bloom_up.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bloom-up-bg"),
@@ -2530,7 +2546,7 @@ fn build_target_bindings(
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: bloom_up_uniforms[i].as_entire_binding(),
+                    resource: uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
