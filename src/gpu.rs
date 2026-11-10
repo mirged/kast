@@ -1,6 +1,18 @@
+//! Thin helpers over `wgpu` resource creation.
+//!
+//! Nothing here is clever: the point is that every buffer, texture and view in the renderer is
+//! created in one of these functions, so the size/usage/label conventions live in one file and a
+//! new pipeline cannot quietly introduce a different one. Several helpers clamp their inputs
+//! (`size.max(16)`, `width.max(1)`, `mip_levels.max(1)`) so a zero-sized scene or a 0×0 window
+//! degrades into a valid resource instead of a validation error.
+
 use bytemuck::Pod;
 use wgpu::util::DeviceExt;
 
+/// Create a buffer pre-filled from a slice of `Pod` data.
+///
+/// `usage` is taken verbatim, so callers must already include the bind usage they intend; the
+/// data is written through the staging path `create_buffer_init` uses.
 pub fn buffer_init<T: Pod>(
     device: &wgpu::Device,
     label: &str,
@@ -14,6 +26,10 @@ pub fn buffer_init<T: Pod>(
     })
 }
 
+/// Create an uninitialised buffer for per-frame uploads, e.g. the light and object lists.
+///
+/// The size is clamped to 16 bytes because `wgpu` rejects zero-sized buffers, and an empty scene
+/// is a normal state at start-up. Use [`uniform_buffer`] for anything bound as a uniform.
 pub fn buffer_empty(
     device: &wgpu::Device,
     label: &str,
@@ -28,6 +44,10 @@ pub fn buffer_empty(
     })
 }
 
+/// Create a uniform buffer holding a single `Pod` value, with `COPY_DST` for later writes.
+///
+/// The bind group layout's min binding size must match `size_of::<T>()`; the renderer builds both
+/// from the same type so this holds by construction.
 pub fn uniform_buffer<T: Pod>(device: &wgpu::Device, label: &str, data: &T) -> wgpu::Buffer {
     buffer_init(
         device,
@@ -37,6 +57,12 @@ pub fn uniform_buffer<T: Pod>(device: &wgpu::Device, label: &str, data: &T) -> w
     )
 }
 
+/// Create a 2D texture with explicit format, usage, mip count and sample count.
+///
+/// Used for every render target and every uploaded image; the renderer passes
+/// `sample_count: 1` everywhere, so the parameter exists for future MSAA surfaces rather than for
+/// current use.
+#[allow(clippy::too_many_arguments)]
 pub fn texture_2d(
     device: &wgpu::Device,
     label: &str,
@@ -63,6 +89,10 @@ pub fn texture_2d(
     })
 }
 
+/// Create a cube texture: a D2 texture with six array layers, viewed as a cube.
+///
+/// This is the IBL storage shape — the sky is rendered into it and the prefiltered radiance chain
+/// is stored in its mips.
 pub fn texture_cube(
     device: &wgpu::Device,
     label: &str,
@@ -87,6 +117,8 @@ pub fn texture_cube(
     })
 }
 
+/// Create a 2D array texture with the given layer count, e.g. one layer per shadow cascade.
+#[allow(clippy::too_many_arguments)]
 pub fn texture_2d_array(
     device: &wgpu::Device,
     label: &str,
@@ -113,10 +145,14 @@ pub fn texture_2d_array(
     })
 }
 
+/// The default view: every mip level, every layer, the texture's own dimension.
+///
+/// Used for material textures and for render targets that are sampled whole.
 pub fn default_view(texture: &wgpu::Texture) -> wgpu::TextureView {
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
+/// A cube view of one mip level, for binding a specific roughness level of the radiance chain.
 pub fn cube_view(texture: &wgpu::Texture, mip: u32) -> wgpu::TextureView {
     texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("cube-view"),
@@ -130,6 +166,7 @@ pub fn cube_view(texture: &wgpu::Texture, mip: u32) -> wgpu::TextureView {
     })
 }
 
+/// A 2D view of a single cube face at one mip level, so a face can be rendered into as a target.
 pub fn cube_face_view(texture: &wgpu::Texture, mip: u32, face: u32) -> wgpu::TextureView {
     texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("cube-face-view"),
@@ -143,6 +180,7 @@ pub fn cube_face_view(texture: &wgpu::Texture, mip: u32, face: u32) -> wgpu::Tex
     })
 }
 
+/// A 2D view of one array layer (one shadow cascade), for rendering into or sampling.
 pub fn array_layer_view(texture: &wgpu::Texture, layer: u32) -> wgpu::TextureView {
     texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("array-layer-view"),
@@ -156,6 +194,12 @@ pub fn array_layer_view(texture: &wgpu::Texture, layer: u32) -> wgpu::TextureVie
     })
 }
 
+/// Write a rectangle of pixels into one mip level of one array layer.
+///
+/// `bytes_per_row` is explicit because `queue.write_texture` requires it for multi-row images and
+/// callers here always have tightly packed RGBA8 rows; `layer` selects the array slice (0 for
+/// plain 2D textures).
+#[allow(clippy::too_many_arguments)]
 pub fn upload_2d(
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
@@ -192,6 +236,10 @@ pub fn upload_2d(
 }
 
 /// Build a full RGBA8 mip pyramid on the CPU using box-ish filtering.
+///
+/// Each level is the previous one halved with a triangle filter, continuing until 1×1, which is
+/// what uploads need: `wgpu` has no CPU-side mip generation, and doing it in a compute pass would
+/// add a pipeline per format for a one-off cost at load time.
 pub fn generate_mips_rgba8(base: &image::RgbaImage) -> Vec<(u32, u32, Vec<u8>)> {
     let mut levels = Vec::new();
     let mut w = base.width().max(1);
@@ -211,10 +259,22 @@ pub fn generate_mips_rgba8(base: &image::RgbaImage) -> Vec<(u32, u32, Vec<u8>)> 
     levels
 }
 
+/// Round `value` up to the next multiple of `alignment`.
+///
+/// Needed for texture-to-buffer copies: `wgpu` requires `bytes_per_row` to be a multiple of
+/// [`wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`] (256), which is why a 1280-wide RGBA8 readback has
+/// three rows' worth of padding to strip afterwards.
 pub fn align_to(value: u32, alignment: u32) -> u32 {
     value.div_ceil(alignment) * alignment
 }
 
+/// The device limits to request: WebGPU defaults, lowered where the adapter cannot reach them.
+///
+/// Starting from [`wgpu::Limits::default`] (rather than the adapter's maxima) keeps the crate
+/// working identically on every backend and prevents an over-optimistic request from failing on a
+/// weaker device. The fields that matter here are texture size (render targets, shadow map), bind
+/// groups, sampled textures per stage (five material maps plus the G-buffer and IBL) and the
+/// storage/uniform binding sizes for the light and object buffers.
 pub fn gpu_limits_for(adapter: &wgpu::Adapter) -> wgpu::Limits {
     let mut limits = wgpu::Limits::default();
     let supported = adapter.limits();

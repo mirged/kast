@@ -1,3 +1,14 @@
+//! The scene: meshes, materials, objects, lights and sky — plain data the renderer reads.
+//!
+//! A [`Scene`] owns its GPU resources (uploaded meshes and materials) but is otherwise an ordinary
+//! struct with public `Vec`s. That is deliberate: an application mutates `objects`, `lights` and
+//! `sky` freely between frames, and the renderer picks the changes up with
+//! [`crate::renderer::Renderer::update_objects`] without rebuilding a single pipeline.
+//!
+//! [`default_scene`] builds the demo scene the `kast` viewer shows — a shadowed floor, metal and
+//! dielectric spheres, brick and emissive test materials, a sun and three extra lights — entirely
+//! from procedural textures, so the crate ships with no assets.
+
 use anyhow::Result;
 use glam::{Mat4, Vec3};
 use std::f32::consts::PI;
@@ -8,29 +19,55 @@ use crate::mesh::Mesh;
 
 pub mod loader;
 
+/// What a light's direction and position mean.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LightKind {
+    /// Infinite sun: `direction` only, no attenuation. Exactly one is used for the shadow cascades.
     Directional,
+    /// Omnidirectional point light with a soft `range` falloff.
     Point,
+    /// Point light restricted to a cone by `inner_angle`/`outer_angle`.
     Spot,
 }
 
-#[derive(Clone, Debug)]
+/// One punctual light.
+///
+/// Construct with [`Light::directional`], [`Light::point`] or [`Light::spot`], which set the
+/// fields a given kind actually uses; the struct keeps all of them so switching a light's kind or
+/// animating it in place needs no reallocation of the scene's light list.
 pub struct Light {
+    /// Which of the three light types this is.
     pub kind: LightKind,
+    /// World-space position. Unused (and zero) for directional lights.
     pub position: Vec3,
+    /// Unit vector the light travels along — point it *away* from the lamp, toward what it lights.
+    /// For the sun this is the reverse of [`Sky::sun_direction`].
     pub direction: Vec3,
+    /// Linear RGB colour of the light.
     pub color: Vec3,
+    /// Radiance multiplier applied to `color`. The unit is not physical — a sun of 4 and a point
+    /// light of 18 are tuned against the sky's own intensity.
     pub intensity: f32,
+    /// Clip distance in metres; lights beyond it contribute nothing. Ignored for directional
+    /// lights.
     pub range: f32,
+    /// Cosine of the spot's full-brightness cone angle (not the angle itself).
     pub inner_angle: f32,
+    /// Cosine of the spot's outer cone angle; the falloff goes from `inner_angle` to here.
     pub outer_angle: f32,
+    /// Requested shadow casting. Only the sun currently has a shadow map, so this is recorded but
+    /// does not yet add punctual shadows.
     #[allow(dead_code)]
     pub cast_shadows: bool,
+    /// Cheap on/off switch — a disabled light still occupies its slot but contributes nothing.
     pub enabled: bool,
 }
 
 impl Light {
+    /// A sun: parallel light travelling along `direction`, with no distance falloff.
+    ///
+    /// `direction` is normalised here, and the light is created with `cast_shadows` set — it is
+    /// the light the cascades are built from.
     pub fn directional(direction: Vec3, color: Vec3, intensity: f32) -> Self {
         Self {
             kind: LightKind::Directional,
@@ -46,6 +83,8 @@ impl Light {
         }
     }
 
+    /// An omnidirectional light at `position` reaching `range` metres, intensity falling off
+    /// smoothly to zero at that distance.
     pub fn point(position: Vec3, color: Vec3, intensity: f32, range: f32) -> Self {
         Self {
             kind: LightKind::Point,
@@ -61,6 +100,11 @@ impl Light {
         }
     }
 
+    /// A cone light at `position` aimed along `direction`.
+    ///
+    /// `inner_angle` and `outer_angle` are the *cosines* of the cone half-angles, so 1.0 is a
+    /// pencil-thin beam and lower values widen it — pass `(0.30_f32).cos()` for a 30° corner.
+    /// Between the two cosines the light fades out, which is what gives a spotlight its soft edge.
     pub fn spot(
         position: Vec3,
         direction: Vec3,
@@ -85,13 +129,23 @@ impl Light {
     }
 }
 
-#[derive(Clone, Debug)]
+/// The procedural sky: gradient colours, sun disc and the ground half.
+///
+/// The sky is rendered directly (it is the background) *and* used to build the image-based
+/// lighting cubemaps, so changing these values relights the whole scene — ambient colour,
+/// reflections and fog tint all follow from it.
 pub struct Sky {
+    /// Unit vector toward the sun. `default_scene` aims the directional light back along it.
     pub sun_direction: Vec3,
+    /// Linear sun colour, also used for the disc and the IBL prefilter.
     pub sun_color: Vec3,
+    /// Sun radiance multiplier; 4.0 is a bright but not blown-out afternoon.
     pub sun_intensity: f32,
+    /// Haziness scalar kept for the analytic sky model; higher thickens the horizon band.
     pub turbidity: f32,
+    /// Colour of the lower half of the environment, blended in at the horizon.
     pub ground_color: Vec3,
+    /// Exposure applied while baking the sky cubemap (independent of the camera's EV).
     pub exposure: f32,
     /// Sky colour straight up (linear HDR).
     pub zenith_color: Vec3,
@@ -117,10 +171,19 @@ impl Default for Sky {
     }
 }
 
+/// One instance of a mesh with a material: the unit the renderer draws.
+///
+/// Objects are indices into [`Scene::meshes`] and [`Scene::materials`] rather than owners, so
+/// instancing a model a hundred times costs a hundred small structs and nothing else.
 pub struct SceneObject {
+    /// Index into [`Scene::meshes`].
     pub mesh: usize,
+    /// Index into [`Scene::materials`].
     pub material: usize,
+    /// Model matrix: object space to world space. The renderer derives the normal matrix from
+    /// its upper 3×3, so non-uniform scale is supported (normals are renormalised).
     pub transform: Mat4,
+    /// Hidden objects are skipped by every pass but stay in the scene (and keep their buffers).
     pub visible: bool,
     /// Per-object opacity multiplier. Below 1 the object is drawn with ordered-dither
     /// (screen-door) transparency in the deferred pass.
@@ -130,6 +193,7 @@ pub struct SceneObject {
 }
 
 impl SceneObject {
+    /// A fully visible, fully opaque, shadow-casting object at `transform`.
     pub fn new(mesh: usize, material: usize, transform: Mat4) -> Self {
         Self {
             mesh,
@@ -142,21 +206,38 @@ impl SceneObject {
     }
 }
 
+/// Everything that can be drawn, plus the lighting and sky it is drawn under.
+///
+/// Build one by hand (the fields are public and [`Scene::add_mesh`] / [`Scene::add_material`]
+/// return the indices objects need), from [`default_scene`], or from a file with
+/// [`loader::load`].
 pub struct Scene {
+    /// Uploaded meshes, indexed by [`SceneObject::mesh`].
     pub meshes: Vec<Mesh>,
+    /// Uploaded materials, indexed by [`SceneObject::material`].
     pub materials: Vec<Material>,
+    /// Drawable instances.
     pub objects: Vec<SceneObject>,
+    /// Punctual lights; the first directional light is treated as the sun.
     pub lights: Vec<Light>,
+    /// The sky dome, which also seeds the IBL cubemaps.
     pub sky: Sky,
 }
 
 impl Scene {
+    /// Upload `geometry` as a new mesh and return its index.
+    ///
+    /// The geometry is consumed: its vertex/index buffers live on the GPU from here on.
     pub fn add_mesh(&mut self, device: &wgpu::Device, name: &str, geometry: Geometry) -> usize {
         let mesh = Mesh::new(device, name, &geometry.vertices, &geometry.indices);
         self.meshes.push(mesh);
         self.meshes.len() - 1
     }
 
+    /// Create a material from `desc` and `maps` and return its index.
+    ///
+    /// Fails only if a texture upload fails. The bind group is created lazily by the renderer, so
+    /// the material is usable the very next frame without any extra call.
     pub fn add_material(
         &mut self,
         device: &wgpu::Device,
@@ -169,6 +250,10 @@ impl Scene {
         Ok(self.materials.len() - 1)
     }
 
+    /// The first directional light, i.e. the one driving the shadow cascades.
+    ///
+    /// `None` when the scene has no sun, in which case shadows are simply not rendered and the
+    /// sky's own sun position still lights the IBL.
     pub fn sun(&self) -> Option<&Light> {
         self.lights
             .iter()
@@ -176,6 +261,7 @@ impl Scene {
     }
 }
 
+/// An RGBA checkerboard, used here for the tile pattern and the floor's roughness variation.
 fn checker_texture(size: u32, cells: u32, a: [u8; 3], b: [u8; 3]) -> image::RgbaImage {
     let mut img = image::RgbaImage::new(size, size);
     let cell = (size / cells.max(1)).max(1);
@@ -190,6 +276,8 @@ fn checker_texture(size: u32, cells: u32, a: [u8; 3], b: [u8; 3]) -> image::Rgba
     img
 }
 
+/// An 8×8 panel grid with faint per-pixel noise, so the floor's UVs are visible and the specular
+/// response is not perfectly uniform.
 fn grid_texture(size: u32, base: [u8; 3], line: [u8; 3], line_width: u32) -> image::RgbaImage {
     let mut img = image::RgbaImage::new(size, size);
     let cell = (size / 8).max(1);
@@ -209,6 +297,11 @@ fn grid_texture(size: u32, base: [u8; 3], line: [u8; 3], line_width: u32) -> ima
     img
 }
 
+/// Convert a grayscale height field into a tangent-space normal map by central differences.
+///
+/// `strength` scales the slope before normalisation. With `tile` the sampling wraps with
+/// `rem_euclid`, so a seamless height map stays seamless — without it, the border is clamped,
+/// which is what you want for a one-off photo-derived height map.
 fn height_to_normal(height: &image::RgbaImage, strength: f32, tile: bool) -> image::RgbaImage {
     let w = height.width() as i32;
     let h = height.height() as i32;
@@ -245,6 +338,11 @@ fn height_to_normal(height: &image::RgbaImage, strength: f32, tile: bool) -> ima
     out
 }
 
+/// A running-bond brick height field: recessed mortar lines and per-brick value noise.
+///
+/// The noisy term uses `wrapping_mul` deliberately. In a release build the multiply wraps anyway,
+/// but a debug build panics on overflow, so the explicit wrap is what keeps `cargo run` (and every
+/// test) able to build the demo scene at all.
 fn brick_height(size: u32) -> image::RgbaImage {
     let mut img = image::RgbaImage::new(size, size);
     let rows = 8;
@@ -262,8 +360,8 @@ fn brick_height(size: u32) -> image::RgbaImage {
             let v = if is_mortar {
                 40
             } else {
-                let n = ((x * 2654435761u32 ^ y * 40503) % 32) as u8;
-                150 + n
+                let n = (x.wrapping_mul(2654435761u32) ^ y.wrapping_mul(40503)) % 32;
+                150 + n as u8
             };
             img.put_pixel(x, y, image::Rgba([v, v, v, 255]));
         }
@@ -271,6 +369,13 @@ fn brick_height(size: u32) -> image::RgbaImage {
     img
 }
 
+/// Build the demo scene: a 60 m floor with a panel grid, four metal/dielectric spheres, a checker
+/// sphere, a brick torus and cubes, an emissive sphere, a chrome cylinder, one sun and three
+/// punctual lights.
+///
+/// Every texture is generated in code — checkerboards, a grid, brick height→normal, an emissive
+/// radial gradient — so this is also a worked example of building materials without assets, and
+/// it is what every screenshot in the README was rendered from.
 pub fn default_scene(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Scene> {
     let mut scene = Scene {
         meshes: Vec::new(),
@@ -503,6 +608,8 @@ pub fn default_scene(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Scene
         Mat4::from_translation(Vec3::new(5.5, 1.0, 3.0)),
     ));
 
+    // The sun light travels along the reverse of the sky's sun direction, so the bright point in
+    // the sky and the direction shadows are cast from agree.
     let sun_travel = -scene.sky.sun_direction;
     scene.lights.push(Light::directional(
         sun_travel,

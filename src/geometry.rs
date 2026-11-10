@@ -1,14 +1,39 @@
+//! Procedural primitives and the CPU-side geometry representation the renderer consumes.
+//!
+//! Every primitive is generated as an indexed triangle mesh with positions, normals, UVs and
+//! tangents; [`Geometry`] is the hand-off type between generation (or a glTF importer) and
+//! [`crate::mesh::Mesh`], which uploads it to the GPU.
+//!
+//! Tangents are derived from the UV layout rather than authored, so textures that rely on normal
+//! mapping line up with the unwrap even for procedural shapes. Surfaces with degenerate UVs (poles
+//! of a sphere, the seam of a cylinder) fall back to an arbitrary tangent orthogonal to the normal
+//! and a `w` of ±1 that keeps the bitangent consistent across the seam.
+
 use glam::{Vec2, Vec3, Vec4};
 use std::f32::consts::PI;
 
 use crate::mesh::Vertex;
 
+/// An indexed triangle mesh held in main memory.
+///
+/// Produced by the primitive constructors in this module, by
+/// [`Geometry::from_parts`] for imported data, and uploaded once by
+/// [`crate::mesh::Mesh::new`]. The renderer treats it as static: dynamic objects move by
+/// per-object transforms, not by rewriting vertex buffers.
 pub struct Geometry {
+    /// Interleaved vertex records; `indices` index into this vector.
     pub vertices: Vec<Vertex>,
+    /// Triangle list: every three entries form one triangle, wound counter-clockwise when seen
+    /// from the outside (the front face).
     pub indices: Vec<u32>,
 }
 
 impl Geometry {
+    /// Build geometry from separate attribute arrays, computing tangents.
+    ///
+    /// `positions`, `normals` and `uvs` must all be the same length and indexed together by
+    /// `indices`; this is the layout glTF and most exporters use. Tangents are generated with
+    /// `compute_tangents`, so callers never supply them.
     pub fn from_parts(
         positions: &[[f32; 3]],
         normals: &[[f32; 3]],
@@ -27,12 +52,27 @@ impl Geometry {
         Self { vertices, indices }
     }
 
+    /// Build geometry from ready-made vertices, recomputing their tangents.
+    ///
+    /// Any tangent already stored in `vertices` is discarded: normals, UVs and triangles are the
+    /// authority, which keeps imported meshes consistent with the procedural ones.
     pub fn from_vertices(mut vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
         compute_tangents(&mut vertices, &indices);
         Self { vertices, indices }
     }
 }
 
+/// Compute per-vertex tangents from positions, normals, UVs and triangles.
+///
+/// Uses the standard per-triangle tangent/bitangent accumulation: for each triangle the
+/// derivatives of position and UV along the two edges give a tangent and a bitangent, which are
+/// summed into its three vertices. The accumulated tangent is then Gram-Schmidt orthogonalised
+/// against the vertex normal and its handedness is stored in `tangent.w`, so a shader can rebuild
+/// the bitangent as `cross(normal, tangent.xyz) * tangent.w`.
+///
+/// Degenerate cases — zero-area UV triangles, vertices whose accumulated tangent cancels out, and
+/// normals that are parallel to the fallback axis — are handled explicitly rather than producing
+/// NaNs, because a single NaN vertex spreads across a whole draw call once interpolated.
 fn compute_tangents(vertices: &mut [Vertex], indices: &[u32]) {
     let mut tan = vec![Vec3::ZERO; vertices.len()];
     let mut bitan = vec![Vec3::ZERO; vertices.len()];
@@ -86,6 +126,11 @@ fn compute_tangents(vertices: &mut [Vertex], indices: &[u32]) {
     }
 }
 
+/// A flat grid in the XZ plane, centred on the origin and facing +Y.
+///
+/// `size` is the full edge length and `subdivisions` the number of quads per axis (clamped to at
+/// least 1). UVs run 0..1 across the whole plane, so texture scale is controlled by the material's
+/// `uv_scale` rather than by tessellation density.
 pub fn plane(size: f32, subdivisions: u32) -> Geometry {
     let n = subdivisions.max(1);
     let mut positions = Vec::new();
@@ -112,6 +157,11 @@ pub fn plane(size: f32, subdivisions: u32) -> Geometry {
     Geometry::from_parts(&positions, &normals, &uvs, indices)
 }
 
+/// An axis-aligned cube centred on the origin with edge length `size`.
+///
+/// Each face gets its own four vertices so the normals stay hard-edged, and UVs are oriented the
+/// same way as the face's local right/up axes so image textures are not mirrored on opposite
+/// faces.
 pub fn cube(size: f32) -> Geometry {
     let h = size * 0.5;
     let faces: [([f32; 3], [f32; 3], [f32; 3], [f32; 3]); 6] = [
@@ -177,6 +227,12 @@ pub fn cube(size: f32) -> Geometry {
     Geometry::from_parts(&positions, &normals, &uvs, indices)
 }
 
+/// A latitude/longitude sphere of the given `radius`.
+///
+/// `segments` is the subdivision count around the equator and `rings` the count from pole to pole
+/// (clamped to 3 and 2 respectively). Vertices sit exactly on the sphere and carry the sphere
+/// normal, so the silhouette is smooth-shaded — but the poles are triangles with collapsed UVs,
+/// which is exactly the degenerate case `compute_tangents` falls back on.
 pub fn uv_sphere(radius: f32, segments: u32, rings: u32) -> Geometry {
     let segments = segments.max(3);
     let rings = rings.max(2);
@@ -210,6 +266,11 @@ pub fn uv_sphere(radius: f32, segments: u32, rings: u32) -> Geometry {
     Geometry::from_parts(&positions, &normals, &uvs, indices)
 }
 
+/// A torus lying in the XZ plane: `major` is the distance from the origin to the tube centre and
+/// `minor` the tube radius.
+///
+/// The normal at every vertex points away from the tube centre line, so the inner surface (which
+/// faces inward toward the hole) shades correctly instead of being lit from outside.
 pub fn torus(major: f32, minor: f32, major_segments: u32, minor_segments: u32) -> Geometry {
     let major_segments = major_segments.max(3);
     let minor_segments = minor_segments.max(3);
@@ -246,6 +307,13 @@ pub fn torus(major: f32, minor: f32, major_segments: u32, minor_segments: u32) -
     Geometry::from_parts(&positions, &normals, &uvs, indices)
 }
 
+/// An upright cylinder along the Y axis, centred on the origin.
+///
+/// `radius` and `height` are full extents; `segments` is the subdivision count around the
+/// circumference. With `capped` the two circular ends are added as triangle fans with flat ±Y
+/// normals, wound outward (the top fan is reversed relative to the bottom so back-face culling
+/// works on both). Without caps the shape is an open tube and is visibly hollow from above or
+/// below — useful for tests, rarely what you want on screen.
 pub fn cylinder(radius: f32, height: f32, segments: u32, capped: bool) -> Geometry {
     let segments = segments.max(3);
     let mut positions = Vec::new();

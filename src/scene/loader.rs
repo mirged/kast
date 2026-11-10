@@ -1,3 +1,17 @@
+//! glTF 2.0 import: turns a `.gltf`/`.glb` file into a [`Scene`].
+//!
+//! This is a deliberately small importer, not a full glTF runtime. It reads the default scene's
+//! node tree (or the first scene if none is marked default), one mesh per primitive, PBR
+//! metallic-roughness materials with their texture maps, and `KHR_lights_punctual` lights found on
+//! nodes. Everything a static model needs to render — geometry, normals, UVs, tangents, material
+//! factors and maps, node transforms, lights — is covered; animation, skinning, morph targets,
+//! sparse accessors, cameras and multiple UV sets are not, and are silently ignored rather than
+//! erroring.
+//!
+//! ```text
+//! let scene = kast::scene::loader::load(Path::new("model.glb"), &device, &queue)?;
+//! ```
+
 use anyhow::{Context, Result};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
@@ -8,6 +22,11 @@ use crate::geometry::Geometry;
 use crate::material::{MaterialDesc, MaterialMaps};
 use crate::mesh::Vertex;
 
+/// Load a glTF/GLB file into a fresh [`Scene`] with a default sky.
+///
+/// The returned scene has no sun unless the file itself contains a directional light, so a model
+/// loaded this way is lit by the sky's IBL alone; add a [`Light::directional`] if you want
+/// shadows. Errors carry the file path and the failing stage (import, attribute read, upload).
 pub fn load(path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Scene> {
     let mut scene = Scene {
         meshes: Vec::new(),
@@ -20,6 +39,10 @@ pub fn load(path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<S
     Ok(scene)
 }
 
+/// Load a glTF/GLB file *into* an existing scene, appending meshes, materials, objects and lights.
+///
+/// This is the composition path: load several models into one world, or add a model to a
+/// procedurally built scene. Existing indices stay valid because everything is appended.
 pub fn load_into(
     path: &Path,
     device: &wgpu::Device,
@@ -29,6 +52,8 @@ pub fn load_into(
     let (document, buffers, images) =
         gltf::import(path).with_context(|| format!("failed to import glTF: {}", path.display()))?;
 
+    // Materials first: glTF materials are referenced by index, and a primitive whose material is
+    // missing falls back to the default material created just below.
     let mut material_map: HashMap<usize, usize> = HashMap::new();
     for (index, material) in document.materials().enumerate() {
         let (desc, maps) = import_material(&material, &images);
@@ -47,6 +72,8 @@ pub fn load_into(
         MaterialMaps::default(),
     )?;
 
+    // One uploaded mesh per primitive; `mesh_map` remembers which indices belong to which glTF
+    // mesh so instances can be created from nodes without re-uploading geometry.
     let mut mesh_map: HashMap<usize, Vec<usize>> = HashMap::new();
     for (index, mesh) in document.meshes().enumerate() {
         let mut ids = Vec::new();
@@ -82,6 +109,11 @@ pub fn load_into(
     Ok(())
 }
 
+/// Recurse a node tree, emitting a [`SceneObject`] per primitive and a [`Light`] per node light.
+///
+/// `parent` accumulates the transform chain so each object's `transform` is already in world
+/// space; the renderer never sees the glTF hierarchy. Node scale is baked into that matrix, and
+/// the renderer derives its normal matrix from it, so non-uniform node scale shades correctly.
 fn node_walk(
     node: gltf::Node,
     parent: Mat4,
@@ -112,6 +144,8 @@ fn node_walk(
         let intensity = light.intensity();
         let range = light.range().unwrap_or(20.0);
         let position = world.transform_point3(Vec3::ZERO);
+        // glTF lights point down their local -Z axis, which is the same convention the camera
+        // uses; converting through the world matrix is what makes parented lights aim correctly.
         let forward = (-world.transform_vector3(Vec3::Z)).normalize_or_zero();
         match light.kind() {
             gltf::khr_lights_punctual::Kind::Directional => {
@@ -132,6 +166,7 @@ fn node_walk(
                     color,
                     intensity,
                     range,
+                    // glTF stores cone angles; the renderer compares cosines.
                     inner_cone_angle.cos(),
                     outer_cone_angle.cos(),
                 ));
@@ -144,8 +179,16 @@ fn node_walk(
     }
 }
 
+/// The decoded buffer list `gltf::import` returns, kept as an alias because the reader closure
+/// below needs it by name.
 type Buffers = Vec<gltf::buffer::Data>;
 
+/// Read one primitive's attributes into a [`Geometry`].
+///
+/// Positions are required; normals, UVs and tangents are optional and get sane defaults (up-facing
+/// normals, zero UVs). If the file supplies tangents they are used verbatim — an authored tangent
+/// frame beats a derived one for mirrored UVs — otherwise [`Geometry::from_vertices`] derives them
+/// from the UV layout. A primitive with no indices is treated as a non-indexed triangle soup.
 fn read_primitive(primitive: &gltf::Primitive, buffers: &Buffers) -> Result<Geometry> {
     let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
 
@@ -188,6 +231,12 @@ fn read_primitive(primitive: &gltf::Primitive, buffers: &Buffers) -> Result<Geom
     }
 }
 
+/// Map a glTF material onto a [`MaterialDesc`] plus its [`MaterialMaps`].
+///
+/// Factor values are copied straight through (glTF stores base colour linear, which is what the
+/// shader expects). Alpha modes are translated into this renderer's vocabulary: `MASK` becomes an
+/// `alpha_cutoff` of 0.5, `BLEND` becomes dithered transparency in the deferred pass, and `OPAQUE`
+/// leaves both off. Emissive strength comes from `KHR_materials_emissive_strength`.
 fn import_material(
     material: &gltf::Material,
     images: &[gltf::image::Data],
@@ -239,6 +288,13 @@ fn import_material(
     (desc, maps)
 }
 
+/// Convert any glTF image format into RGBA8.
+///
+/// The importer decodes images to raw channel data, not PNG, so every one of glTF's formats has to
+/// be widened here. 8-bit channels are copied, 16-bit channels are scaled down by dropping the low
+/// byte, and float formats are multiplied by 255 and clamped by the cast. Greyscale becomes grey
+/// RGB; two-channel data is treated as luminance+alpha, which is the usual "grey + coverage"
+/// pairing.
 fn decode_image(index: usize, images: &[gltf::image::Data]) -> Option<image::RgbaImage> {
     let data = images.get(index)?;
     let w = data.width;

@@ -1,29 +1,89 @@
+//! Image-based lighting: bake the analytical sky into cubemaps the shading pass can sample.
+//!
+//! Four products come out of one command buffer, all generated on the GPU at start-up (and again
+//! whenever [`Renderer::refresh_environment`](crate::renderer::Renderer::refresh_environment) is
+//! called):
+//!
+//! - **environment cube** — the sky rendered into a 256² cube, the source for the passes below,
+//! - **irradiance cube** — cosine-convolved diffuse ambient, 32² per face,
+//! - **prefiltered radiance cube** — GGX-prefiltered specular reflections, one mip per roughness
+//!   level, 128² down to 4²,
+//! - **BRDF LUT** — the split-sum integration term (`Rg16Float`), computed once for all
+//!   materials.
+//!
+//! Splitting diffuse and specular this way is what makes a material's roughness actually change how
+//! sharp its reflections are, without tracing a single ray.
+//!
+//! All four passes use one pipeline layout and one uniform buffer, with the per-pass parameters
+//! selected through a dynamic offset — the buffer is pre-filled with 49 slots (6 env faces, 6
+//! irradiance faces, 36 prefilter mip/face pairs, 1 BRDF), so the whole bake is a burst of
+//! full-screen draws with no buffer writes in between.
+
 use crate::gpu;
 use crate::types::{IblUniform, SkyUniform};
 
+/// Edge length of the source environment cube, in texels per face.
+///
+/// This is the resolution the sky itself is drawn at; the specular chain is derived from it, so it
+/// bounds how crisp a mirror reflection can be.
 pub const ENV_SIZE: u32 = 256;
+
+/// Edge length of one irradiance-cube face. Diffuse ambient is extremely low frequency, so 32² is
+/// more than enough and keeps the convolution cheap.
 pub const IRRADIANCE_SIZE: u32 = 32;
+
+/// Edge length of mip 0 of the prefiltered radiance cube.
 pub const PREFILTER_SIZE: u32 = 128;
+
+/// Number of roughness levels in the prefiltered radiance cube; mip `i` corresponds to roughness
+/// `i / (PREFILTER_MIPS - 1)`, so the last mip is a fully rough lobe.
 pub const PREFILTER_MIPS: u32 = 6;
+
+/// Edge length of the BRDF integration LUT.
 pub const BRDF_SIZE: u32 = 256;
+
+/// Stride between dynamic-offset uniform slots in the IBL parameter buffer.
+///
+/// 256 bytes is the alignment `wgpu` requires for a dynamic offset, which is why the buffer is
+/// padded far beyond the 32 bytes an [`IblUniform`] actually occupies.
 const DYNAMIC_STRIDE: u64 = 256;
 
+/// The baked environment: source cube, irradiance cube, prefiltered radiance chain and BRDF LUT.
+///
+/// Owned by the renderer and re-created (not updated in place) when the sky changes, because the
+/// prefilter chain's mip count and views are fixed at allocation time.
 #[allow(dead_code)]
 pub struct Ibl {
+    /// The sky itself, rendered into a cube. Useful as a background and as the prefilter source.
     pub env_texture: wgpu::Texture,
+    /// Cube view of the environment, every face at mip 0.
     pub env_view: wgpu::TextureView,
+    /// Cosine-convolved diffuse ambient, `Rgba16Float`.
     pub irradiance_texture: wgpu::Texture,
+    /// Cube view of the irradiance cube.
     pub irradiance_view: wgpu::TextureView,
+    /// GGX-prefiltered specular reflections with one mip per roughness level.
     pub prefilter_texture: wgpu::Texture,
+    /// One cube view per mip level, so a shader can sample a specific roughness directly.
     pub prefilter_views: Vec<wgpu::TextureView>,
+    /// Cube view spanning every mip, for `textureSampleLevel` with an explicit LOD.
     pub prefilter_full_view: wgpu::TextureView,
+    /// The split-sum BRDF integration term, `Rg16Float` (scale in R, bias in G).
     pub brdf_texture: wgpu::Texture,
+    /// 2D view of the BRDF LUT.
     pub brdf_view: wgpu::TextureView,
+    /// Trilinear sampler clamped to the mip chain, shared by all four products.
     pub sampler: wgpu::Sampler,
+    /// Layout of the groups created here, reused by the lighting pass.
     pub layout: wgpu::BindGroupLayout,
 }
 
 impl Ibl {
+    /// Bake all four products for `sky` and return them ready to bind.
+    ///
+    /// This compiles four pipelines and records 49 full-screen draws into a single command buffer,
+    /// so it is a start-up cost: a few milliseconds on a discrete GPU, noticeably more on a
+    /// software rasterizer. Call it when the sky changes, not per frame.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, sky: &SkyUniform) -> Self {
         let rt = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
 
@@ -92,6 +152,8 @@ impl Ibl {
             include_str!("../../shaders/ibl.wgsl"),
         );
 
+        // One shader module, four entry points: the sky draw, the cosine convolution, the GGX
+        // prefilter and the BRDF integration.
         let pipeline_env = create_fullscreen_pipeline(
             device,
             &layout,
@@ -121,6 +183,8 @@ impl Ibl {
             wgpu::TextureFormat::Rg16Float,
         );
 
+        // Slot map, by construction: 0..6 environment faces, 6..12 irradiance faces,
+        // 12..48 prefilter (face + 6 * mip), 48 the BRDF LUT.
         let mut uniforms = vec![
             IblUniform {
                 params: [0.0; 4],
@@ -129,6 +193,7 @@ impl Ibl {
             64
         ];
         let mut sky = *sky;
+        // The face index and mode are per-draw, not per-sky; they are carried by IblUniform.
         sky.params = [0.0; 4];
 
         let mut put = |slot: usize, u: IblUniform| {
@@ -172,6 +237,7 @@ impl Ibl {
             face: [0, 1, 0, 0],
         };
 
+        // Pack the slots into one buffer at the dynamic-offset alignment the layout declares.
         let slot_bytes = DYNAMIC_STRIDE as usize;
         let mut uniform_data = vec![0u8; uniforms.len() * slot_bytes];
         for (i, uniform) in uniforms.iter().enumerate() {
@@ -290,6 +356,11 @@ impl Ibl {
     }
 }
 
+/// Layout shared by every IBL pass: the sky parameters, the source cube, a sampler, and the
+/// per-draw parameters at a dynamic offset.
+///
+/// Slot 3 is dynamic because all 49 draws share one buffer; the offset selects the face, mip,
+/// sample count and roughness for that draw.
 pub fn create_ibl_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("ibl-bgl"),
@@ -338,6 +409,10 @@ pub fn create_ibl_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+/// Build a no-depth, no-blend full-screen pipeline with one bind group, writing `format`.
+///
+/// `fragment_entry` picks which of the four IBL passes this pipeline runs; the vertex stage is
+/// always the shared `vs_fullscreen`.
 pub fn create_fullscreen_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -385,6 +460,9 @@ pub fn create_fullscreen_pipeline(
     })
 }
 
+/// Draw one full-screen triangle into `target` with the given pipeline and dynamic offset.
+///
+/// Used 49 times during the bake; each call is its own render pass because the target view differs.
 #[allow(clippy::too_many_arguments)]
 pub fn run_fullscreen(
     encoder: &mut wgpu::CommandEncoder,

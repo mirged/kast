@@ -1,9 +1,26 @@
 [package]
-name = "kast"
+name = "kast-render"
 version = "0.1.0"
 edition = "2024"
-description = "GPU photorealistic renderer built on wgpu: deferred PBR, IBL, cascaded shadows, SSAO, SSR, bloom and ACES tonemapping"
+rust-version = "1.85"
+description = "Photorealistic real-time renderer on wgpu: deferred PBR, IBL, cascaded PCSS shadows, SSAO, SSR, bloom, DoF and ACES tonemapping"
+documentation = "https://docs.rs/kast-render"
+repository = "https://github.com/mirged/kast"
+readme = "README.md"
 license = "MIT OR Apache-2.0"
+authors = ["Vladislav Buinickij <ntaip004@gmail.com>"]
+keywords = ["wgpu", "renderer", "pbr", "graphics", "gamedev"]
+categories = ["rendering", "graphics", "game-development"]
+
+# The crates.io name `kast` belongs to an unrelated project, so the package is
+# published as `kast-render`; the library crate keeps the name `kast`.
+[lib]
+name = "kast"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kast"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"

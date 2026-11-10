@@ -1,3 +1,11 @@
+//! The interactive viewer: window, event loop, and the per-frame hand-off to the renderer.
+//!
+//! This module is the binary's, not the library's — it exists so `main.rs` stays a thin argument
+//! parser. [`App`] implements `winit`'s `ApplicationHandler`, owns the window and the renderer
+//! state, and translates input into [`Camera`] calls and [`Settings`] toggles. The interesting
+//! part for a library user is [`render_frame`]: acquire the swap-chain texture, render into it,
+//! present, and cope with a lost surface.
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,20 +23,38 @@ use kast::context::GpuContext;
 use kast::renderer::Renderer;
 use kast::scene::{self, Scene};
 
+/// The application: lazily-initialised GPU state plus the values that outlive it.
+///
+/// Nothing GPU-bound exists until the event loop reports `resumed`, which is why [`State`] is an
+/// `Option` — on some platforms a window can be re-created after the surface is lost, and the
+/// renderer has to be rebuilt with it.
 pub struct App {
+    /// Model path from `--model`, if the viewer was asked to load one; `None` means the
+    /// procedural demo scene.
     pub model: Option<PathBuf>,
+    /// The window, kept alive for as long as the surface borrows it.
     window: Option<Arc<Window>>,
+    /// Device, renderer, scene and camera, created in `resumed`.
     state: Option<State>,
+    /// Last cursor position, used to decide whether to grab the pointer.
     cursor: Option<PhysicalPosition<f64>>,
+    /// Timestamp of the previous frame, for the delta passed to the camera and the renderer.
     last_frame: Instant,
+    /// Frames presented since start-up, for the periodic fps log.
     frame_count: u64,
+    /// Seconds accumulated since the last fps log.
     accum: f32,
+    /// Frames counted in `accum`.
     samples: u32,
 }
 
+/// Everything that only exists once a window and a GPU are available.
 struct State {
+    /// Device, queue and the configured surface.
     ctx: GpuContext,
+    /// All pipelines and render targets, sized to the surface.
     renderer: Renderer,
+    /// The scene being viewed (demo or glTF) and the camera flying through it.
     scene: Scene,
     camera: Camera,
 }
@@ -76,6 +102,8 @@ impl App {
             &mut scene,
         )?;
 
+        // Push the current camera state into the renderer once; from here on a redraw keeps the
+        // two in sync (`exposure_ev` per frame, in `window_event`).
         self.state = Some(State {
             ctx,
             renderer,
@@ -87,6 +115,11 @@ impl App {
     }
 }
 
+/// Aim the camera at the whole scene and back off far enough to see it.
+///
+/// The bounds are the union of every object's transformed mesh bounding box, which is exactly what
+/// the renderer's culler uses — so the initial framing is never inside a model, and a 2 m prop and
+/// a 2 km island both come into view without hand-tuned numbers.
 fn frame_scene(camera: &mut Camera, scene: &Scene) {
     let mut min = glam::Vec3::splat(f32::MAX);
     let mut max = glam::Vec3::splat(f32::MIN);
@@ -107,6 +140,10 @@ fn frame_scene(camera: &mut Camera, scene: &Scene) {
 }
 
 impl ApplicationHandler for App {
+    /// Create the window and all GPU state the first time the platform hands us an event loop.
+    ///
+    /// A failure here is fatal for the viewer: it is logged with its full context chain and the
+    /// loop exits, rather than leaving a blank window up.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_none() {
             if let Err(err) = self.init_state(event_loop) {
@@ -116,6 +153,12 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// Route a window event: quit keys, the F-key effect toggles, camera input, resize, redraw.
+    ///
+    /// Function keys are handled here rather than in the camera because they mutate
+    /// [`Settings`], which the camera does not know about; everything else is delegated. Resize
+    /// updates the surface *and* the renderer's targets, which are two independent sizes to keep
+    /// in step.
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -238,6 +281,11 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// Feed raw mouse motion to the camera.
+    ///
+    /// Raw deltas come through `DeviceEvent`, not `WindowEvent`, because the cursor is captured
+    /// and its absolute position would stop at the window edge — raw motion is unbounded and gives
+    /// a first-person camera its full range of travel.
     fn device_event(
         &mut self,
         _event_loop: &ActiveEventLoop,
@@ -251,6 +299,7 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// Request a redraw every time the loop goes idle, i.e. render at the present mode's rate.
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let (Some(window), Some(state)) = (&self.window, &self.state) {
             let _ = state;
@@ -259,6 +308,7 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Log the effect toggles, so an F-key press leaves a record of the resulting state.
 fn log_state(state: &State) {
     let s = &state.renderer.settings;
     log::info!(
@@ -273,6 +323,11 @@ fn log_state(state: &State) {
     );
 }
 
+/// Render one frame to the swap chain and present it.
+///
+/// The surface-error handling is the part worth copying into a host application: `Lost` and
+/// `Outdated` mean the swap chain needs reconfiguring (resize, mode change, driver hiccup) and are
+/// recoverable by skipping the frame; `Timeout` is likewise benign; only `OutOfMemory` is fatal.
 fn render_frame(state: &mut State) -> Result<()> {
     let ctx = &mut state.ctx;
     let surface = ctx
